@@ -1,55 +1,100 @@
-# Contract Amendment - Vendor Services
+# Contract Amendment - Vendor Agreement
 
-**Contract ID:** VS-2025-0147  
-**Amendment Number:** 001  
-**Date:** August 20, 2025
+**Contract ID:** VND-2024-087  
+**Original Contract Date:** January 15, 2024  
+**Amendment Date:** August 10, 2024  
+**Amendment Number:** 1
 
-## Parties
-**Client:** TechCorp Inc.  
-**Vendor:** Global Solutions Ltd.  
+## Parties Involved
 
-## Original Contract Details
-- **Signed Date:** January 15, 2025
-- **Original Value:** $500,000
-- **Original Term:** 12 months
-- **Services:** Cloud infrastructure management
+### Company
+**TechCorp Solutions Inc.**  
+123 Business Avenue  
+San Francisco, CA 94105  
+**Represented by:** Michael Thompson (VP of Procurement)
+
+### Vendor
+**DataFlow Systems LLC**  
+456 Technology Drive  
+Austin, TX 78701  
+**Represented by:** Jennifer Martinez (Sales Director)
+
+## Original Contract Overview
+The original contract established DataFlow Systems as the primary provider of data analytics services for TechCorp Solutions, with an initial value of $2,500,000 over 24 months.
 
 ## Amendment Details
 
-### Scope Changes
-- Additional security monitoring services
-- 24/7 support coverage
-- Disaster recovery planning
+### 1. Scope Expansion
+The contract scope is expanded to include:
+- **Machine Learning Services:** Advanced predictive analytics
+- **Real-time Data Processing:** Stream processing capabilities  
+- **Custom Dashboard Development:** Executive-level reporting tools
 
-### Financial Impact
-- **Additional Value:** $150,000
-- **Total Contract Value:** $650,000
-- **Payment Terms:** Net 30 days
+### 2. Financial Terms
+- **Additional Contract Value:** $750,000
+- **Total Contract Value:** $3,250,000 (increased from $2,500,000)
+- **Payment Schedule:** Monthly invoicing with Net-30 terms
+- **Performance Bonus:** Up to $50,000 for early delivery milestones
 
-### Timeline Changes
-- **Contract Extension:** 6 months
-- **New End Date:** July 15, 2026
+### 3. Timeline Extension
+- **Original End Date:** January 15, 2026
+- **New End Date:** July 15, 2026 (6-month extension)
+- **Key Milestones:**
+  - ML Services Implementation: October 30, 2024
+  - Real-time Processing Go-Live: December 15, 2024
+  - Dashboard Deployment: February 28, 2025
 
-## Approval and Signatures
+### 4. Service Level Agreements (SLAs)
+- **System Uptime:** 99.9% (unchanged)
+- **Response Time:** < 2 seconds for queries (improved from < 5 seconds)
+- **Support Response:** 24/7 with 4-hour response time for critical issues
 
-**Client Approval:**
-- **Name:** Jennifer Rodriguez, CFO
-- **Date:** August 20, 2025
-- **Signature:** [Signed electronically]
+## Key Personnel Changes
+- **DataFlow Technical Lead:** Alex Park (replacing former lead Tom Wilson)
+- **TechCorp Project Manager:** Rachel Green (continuing from original contract)
 
-**Vendor Approval:**
-- **Name:** Michael Chang, Account Director
-- **Date:** August 20, 2025
-- **Signature:** [Signed electronically]
+## Compliance Requirements
+Both parties agree to maintain compliance with:
+- **SOC 2 Type II** certification requirements
+- **GDPR** data privacy regulations
+- **CCPA** California privacy standards
+- **ISO 27001** information security standards
 
-**Legal Review:**
-- **Reviewed By:** Legal Department
-- **Date:** August 18, 2025
-- **Status:** Approved
+## Risk Management
+- **Data Security:** Enhanced encryption protocols mandatory
+- **Business Continuity:** Disaster recovery plan must be tested quarterly
+- **Vendor Lock-in:** 90-day transition assistance if contract terminates
 
-## Effective Date
-This amendment becomes effective August 25, 2025.
+## Approval Chain
+This amendment has been reviewed and approved by:
+- **Legal Department:** Sandra Lee (Chief Legal Counsel)
+- **Finance Department:** Robert Chang (CFO)
+- **IT Department:** Maria Garcia (CTO)
+- **Executive Team:** James Wilson (CEO)
+
+## Termination Clauses
+Either party may terminate this amendment with 60 days written notice. In case of termination:
+- All work-in-progress must be documented and transferred
+- Final payment due within 30 days of termination date
+- Non-disclosure obligations continue for 3 years post-termination
+
+## Amendment Effective Date
+This amendment becomes effective immediately upon signature by both parties.
+
+---
+
+**TechCorp Solutions Inc.**  
+Signature: _________________________  
+**Michael Thompson**  
+VP of Procurement  
+Date: August 10, 2024
+
+**DataFlow Systems LLC**  
+Signature: _________________________  
+**Jennifer Martinez**  
+Sales Director  
+Date: August 10, 2024
 
 ---
 *Document prepared by Legal Department*  
-*Classification: Confidential*
+*File Reference: LEGAL-2024-VND-087-AMD-01*

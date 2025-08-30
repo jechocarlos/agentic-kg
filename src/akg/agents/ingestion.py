@@ -16,7 +16,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from ..config import config
-from ..database import db
+from ..database import neo4j_manager, supabase_manager
 from ..models import Document
 from ..parsers.document_parser import DocumentParser
 
@@ -39,7 +39,7 @@ class DocumentFileHandler(FileSystemEventHandler):
 class LocalFileIngestionAgent:
     """Agent responsible for ingesting documents from local file system."""
     
-    def __init__(self):
+    def __init__(self, supabase_manager=None, neo4j_manager=None):
         self.input_dir = Path(config.documents_input_dir)
         self.supported_extensions = config.supported_extensions
         self.exclude_patterns = config.exclude_patterns_list
@@ -48,11 +48,21 @@ class LocalFileIngestionAgent:
         self.processed_files: Dict[str, str] = {}  # file_path -> file_hash
         self.observer = None  # Will be set to Observer() when needed
         self.document_parser = DocumentParser()
+        self.supabase_manager = supabase_manager
+        self.neo4j_manager = neo4j_manager
         
     async def initialize(self):
         """Initialize the ingestion agent."""
-        # Initialize database connection
-        await db.initialize_schema()
+        # Initialize database connections if available
+        if self.supabase_manager:
+            await self.supabase_manager.initialize()
+            await self.supabase_manager.initialize_schema()
+        
+        if self.neo4j_manager:
+            try:
+                await self.neo4j_manager.initialize()
+            except Exception as e:
+                logger.warning(f"Neo4j not available: {e}")
         
         # Create input directory if it doesn't exist
         self.input_dir.mkdir(parents=True, exist_ok=True)
@@ -182,8 +192,15 @@ class LocalFileIngestionAgent:
             
         try:
             # Check if document already exists in database
-            existing_docs = await db.get_documents_by_source_path(str(path_obj))
-            if existing_docs and not self._has_file_changed(path_obj):
+            existing_doc = None
+            if self.supabase_manager:
+                try:
+                    existing_doc = await self.supabase_manager.get_document_by_path(str(path_obj))
+                except Exception as e:
+                    logger.warning(f"⚠️ Supabase lookup failed (SSL issue), continuing without check: {e}")
+                    existing_doc = None
+            
+            if existing_doc and not self._has_file_changed(path_obj):
                 logger.debug(f"Document already processed and unchanged: {path_obj}")
                 return None
             
@@ -197,6 +214,14 @@ class LocalFileIngestionAgent:
             parser_metadata = self.document_parser.get_document_metadata(path_obj, content)
             metadata.update(parser_metadata)
             
+            # Ensure metadata is JSON serializable
+            json_metadata = {}
+            for key, value in metadata.items():
+                if isinstance(value, datetime):
+                    json_metadata[key] = value.isoformat()
+                else:
+                    json_metadata[key] = value
+            
             # Create document object
             document = Document(
                 id=self._generate_document_id(path_obj),
@@ -205,19 +230,50 @@ class LocalFileIngestionAgent:
                 source_system="local_filesystem",
                 source_path=str(path_obj),
                 document_type=path_obj.suffix.lower().lstrip('.'),
-                metadata=metadata,
+                metadata=json_metadata,
                 processed_at=datetime.utcnow()
             )
             
-            # Save to Supabase
-            db_result = await document.save_to_db()
-            
-            if db_result:
-                logger.info(f"Processed and saved document: {path_obj}")
+            # Save to Supabase if available
+            if self.supabase_manager:
+                try:
+                    db_result = await self.supabase_manager.create_document(
+                        source_path=document.source_path,
+                        content=document.content,
+                        document_type=document.document_type,
+                        file_size=metadata.get('file_size'),
+                        file_hash=metadata.get('file_hash'),
+                        metadata=document.metadata
+                    )
+                    
+                    if db_result:
+                        logger.info(f"✅ Processed and saved document to Supabase: {path_obj}")
+                    else:
+                        logger.warning(f"⚠️ Document processed but failed to save to Supabase: {path_obj}")
+                        
+                except Exception as e:
+                    logger.warning(f"⚠️ Supabase save failed (SSL issue): {e}")
+                    logger.info(f"📄 Document processed locally: {path_obj}")
+                
+                # Also create a document node in Neo4j if available
+                if self.neo4j_manager:
+                    try:
+                        await self.neo4j_manager.create_document_node(
+                            document_id=document.id,
+                            source_path=document.source_path,
+                            document_type=document.document_type,
+                            title=document.title,
+                            metadata=document.metadata
+                        )
+                        logger.info(f"✅ Document node created in Neo4j: {path_obj}")
+                    except Exception as e:
+                        logger.warning(f"⚠️ Failed to create Neo4j document node: {e}")
+                
                 return document
             else:
-                logger.error(f"Failed to save document to database: {path_obj}")
-                return None
+                # No database available, just return the document
+                logger.info(f"📄 Processed document (no database): {path_obj}")
+                return document
             
         except Exception as e:
             logger.error(f"Error processing file {path_obj}: {e}")

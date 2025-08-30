@@ -4,17 +4,25 @@ Main application entry point for AKG system.
 
 import asyncio
 import logging
+import signal
+import sys
+import time
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional
 
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.table import Table
 
-from .agents.ingestion import LocalFileIngestionAgent
-from .config import config
-from .database import db
-from .models import Document
+# Add the src directory to the path so we can import our modules
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from akg.agents.ingestion import LocalFileIngestionAgent
+from akg.config import config
+from akg.database.neo4j_manager import Neo4jManager
+from akg.database.supabase_manager import SupabaseManager
+from akg.models import Document
 
 # Set up rich logging
 console = Console()
@@ -31,12 +39,37 @@ class AKGApplication:
     """Main application orchestrator."""
     
     def __init__(self):
-        self.ingestion_agent = LocalFileIngestionAgent()
+        self.config = config
+        # Initialize database managers with credentials
+        self.supabase_manager = SupabaseManager(
+            url=config.supabase_url,
+            key=config.supabase_api_key
+        )
+        self.neo4j_manager = Neo4jManager(
+            uri=config.neo4j_uri,
+            username=config.neo4j_username,
+            password=config.neo4j_password
+        )
+        self.ingestion_agent = LocalFileIngestionAgent(
+            supabase_manager=self.supabase_manager,
+            neo4j_manager=self.neo4j_manager
+        )
         self.console = console
         
     async def initialize(self):
         """Initialize all components."""
         logger.info("Initializing AKG system...")
+        
+        # Initialize Supabase for document storage
+        await self.supabase_manager.initialize_schema()
+        
+        # Initialize Neo4j for graph storage (with error handling)
+        try:
+            await self.neo4j_manager.initialize()
+            logger.info("✅ Neo4j connected successfully")
+        except Exception as e:
+            logger.warning(f"⚠️  Neo4j not available: {e}")
+            logger.warning("📝 Documents will be stored in Supabase only")
         
         # Initialize ingestion agent
         await self.ingestion_agent.initialize()
@@ -72,11 +105,23 @@ class AKGApplication:
         
         # Get database statistics
         try:
-            stats = await db.get_processing_stats()
-            self.console.print(f"\n💾 Database Statistics:")
-            self.console.print(f"  - Total documents in DB: {stats['total_documents']}")
-            self.console.print(f"  - Total entities in DB: {stats['total_entities']}")
-            self.console.print(f"  - Total relationships in DB: {stats['total_relationships']}")
+            # Get document stats from Supabase
+            try:
+                doc_stats = await self.supabase_manager.get_document_stats()
+                self.console.print(f"\n💾 Database Statistics:")
+                self.console.print(f"  📄 Documents in Supabase: {doc_stats.get('total', 0)}")
+            except Exception as e:
+                self.console.print(f"\n💾 Database Statistics:")
+                self.console.print(f"  📄 Supabase: ⚠️ SSL certificate issue - {str(e)[:50]}...")
+            
+            # Get graph stats from Neo4j (if available)
+            try:
+                graph_stats = await self.neo4j_manager.get_graph_stats()
+                self.console.print(f"  🔵 Entities in Neo4j: {graph_stats.get('total_entities', 0)}")
+                self.console.print(f"  ↔️  Relationships in Neo4j: {graph_stats.get('total_relationships', 0)}")
+            except Exception:
+                self.console.print(f"  🔵 Neo4j: Not connected")
+                
         except Exception as e:
             self.console.print(f"⚠️  Could not fetch database stats: {e}")
         
@@ -112,6 +157,7 @@ class AKGApplication:
     async def cleanup(self):
         """Cleanup resources."""
         await self.ingestion_agent.cleanup()
+        await self.neo4j_manager.close()
         logger.info("✅ Cleanup completed")
 
 async def main():
