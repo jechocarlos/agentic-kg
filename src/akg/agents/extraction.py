@@ -1,5 +1,5 @@
 """
-Entity and relationship extraction agent using Google Gemini.
+Entity and relationship extraction agent using Google Gemini with fallback to pattern matching.
 """
 
 import json
@@ -15,17 +15,19 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 from ..config import config
 from ..models import Document, Entity, Relationship
 from ..types import EntityType, RelationType
+from .fallback_extraction import FallbackEntityExtractor
 
 logger = logging.getLogger(__name__)
 console = Console()
 
 
 class EntityExtractionAgent:
-    """Agent responsible for extracting entities and relationships using Google Gemini."""
+    """Agent responsible for extracting entities and relationships using Google Gemini with fallback."""
     
     def __init__(self, neo4j_manager=None):
         self.neo4j_manager = neo4j_manager
         self.model = None
+        self.fallback_extractor = FallbackEntityExtractor()
         self._initialize_gemini()
         
     def _initialize_gemini(self):
@@ -40,28 +42,40 @@ class EntityExtractionAgent:
             raise
     
     async def extract_entities_and_relationships(self, document: Document) -> Tuple[List[Entity], List[Relationship]]:
-        """Extract entities and relationships from a document using Gemini."""
+        """Extract entities and relationships from a document using Gemini with fallback."""
         logger.info(f"🧠 Extracting entities from: {document.title}")
         
-        if not self.model:
-            logger.error("❌ Gemini model not initialized")
-            return [], []
+        # Try Gemini first
+        if self.model:
+            try:
+                # Create the extraction prompt
+                prompt = self._create_extraction_prompt(document)
+                
+                # Get response from Gemini
+                response = self.model.generate_content(prompt)
+                
+                # Parse the response
+                entities, relationships = self._parse_gemini_response(response.text, document.id)
+                
+                logger.info(f"✅ Extracted {len(entities)} entities and {len(relationships)} relationships using Gemini")
+                return entities, relationships
+                
+            except Exception as e:
+                logger.warning(f"⚠️ Gemini extraction failed for {document.title}: {e}")
+                logger.info("🔄 Falling back to pattern-based extraction...")
+        else:
+            logger.warning("❌ Gemini model not available, using fallback extraction")
         
+        # Fallback to pattern-based extraction
         try:
-            # Create the extraction prompt
-            prompt = self._create_extraction_prompt(document)
+            entities = self.fallback_extractor.extract_entities(document)
+            relationships = self.fallback_extractor.extract_relationships(entities, document)
             
-            # Get response from Gemini
-            response = self.model.generate_content(prompt)
-            
-            # Parse the response
-            entities, relationships = self._parse_gemini_response(response.text, document.id)
-            
-            logger.info(f"✅ Extracted {len(entities)} entities and {len(relationships)} relationships")
+            logger.info(f"✅ Extracted {len(entities)} entities and {len(relationships)} relationships using fallback")
             return entities, relationships
             
         except Exception as e:
-            logger.error(f"❌ Failed to extract entities from {document.title}: {e}")
+            logger.error(f"❌ Both Gemini and fallback extraction failed for {document.title}: {e}")
             return [], []
     
     def _create_extraction_prompt(self, document: Document) -> str:
@@ -218,39 +232,33 @@ Only respond with valid JSON. Do not include any other text.
             return False
         
         try:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=console,
-            ) as progress:
-                # Save entities
-                if entities:
-                    task = progress.add_task(f"Saving {len(entities)} entities...", total=None)
-                    for entity in entities:
-                        await self.neo4j_manager.create_entity(
-                            entity_id=entity.id,
-                            name=entity.name,
-                            entity_type=entity.entity_type.value,
-                            document_id=entity.document_id,
-                            properties=entity.properties,
-                            confidence=entity.confidence_score
-                        )
-                    progress.update(task, description=f"✅ Saved {len(entities)} entities")
-                
-                # Save relationships
-                if relationships:
-                    task = progress.add_task(f"Saving {len(relationships)} relationships...", total=None)
-                    for relationship in relationships:
-                        await self.neo4j_manager.create_relationship(
-                            relationship_id=relationship.id,
-                            source_entity_id=relationship.source_entity_id,
-                            target_entity_id=relationship.target_entity_id,
-                            relationship_type=relationship.relationship_type.value,
-                            document_id=relationship.document_id,
-                            properties=relationship.properties,
-                            confidence=relationship.confidence_score
-                        )
-                    progress.update(task, description=f"✅ Saved {len(relationships)} relationships")
+            # Save entities
+            if entities:
+                logger.info(f"💾 Saving {len(entities)} entities to Neo4j...")
+                for entity in entities:
+                    await self.neo4j_manager.create_entity(
+                        entity_id=entity.id,
+                        name=entity.name,
+                        entity_type=entity.entity_type.value,
+                        document_id=entity.document_id,
+                        properties=entity.properties,
+                        confidence=entity.confidence_score
+                    )
+                logger.info(f"✅ Saved {len(entities)} entities")
+            
+            # Save relationships
+            if relationships:
+                logger.info(f"🔗 Saving {len(relationships)} relationships to Neo4j...")
+                for relationship in relationships:
+                    await self.neo4j_manager.create_relationship(
+                        source_entity_id=relationship.source_entity_id,
+                        target_entity_id=relationship.target_entity_id,
+                        relationship_type=relationship.relationship_type.value,
+                        document_id=relationship.document_id,
+                        properties=relationship.properties,
+                        confidence=relationship.confidence_score
+                    )
+                logger.info(f"✅ Saved {len(relationships)} relationships")
             
             logger.info(f"✅ Successfully saved {len(entities)} entities and {len(relationships)} relationships to Neo4j")
             return True

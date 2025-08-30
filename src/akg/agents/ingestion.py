@@ -258,12 +258,21 @@ class LocalFileIngestionAgent:
                 # Also create a document node in Neo4j if available
                 if self.neo4j_manager:
                     try:
+                        # Filter metadata to only include primitive types for Neo4j
+                        simple_metadata = {}
+                        if document.metadata:
+                            for key, value in document.metadata.items():
+                                if isinstance(value, (str, int, float, bool)):
+                                    simple_metadata[key] = value
+                                elif isinstance(value, list) and all(isinstance(item, (str, int, float, bool)) for item in value):
+                                    simple_metadata[key] = value
+                        
                         await self.neo4j_manager.create_document_node(
                             document_id=document.id,
                             source_path=document.source_path,
                             document_type=document.document_type,
                             title=document.title,
-                            metadata=document.metadata
+                            metadata=simple_metadata if simple_metadata else None
                         )
                         logger.info(f"✅ Document node created in Neo4j: {path_obj}")
                     except Exception as e:

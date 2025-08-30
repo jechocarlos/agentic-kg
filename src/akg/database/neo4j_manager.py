@@ -86,24 +86,35 @@ class Neo4jManager:
         """Create a document node in Neo4j."""
         try:
             async with self.driver.session() as session:
-                query = """
-                MERGE (d:Document {id: $document_id})
+                # Handle metadata properly - Neo4j doesn't like empty maps
+                metadata_str = ""
+                metadata_params = {}
+                if metadata and len(metadata) > 0:
+                    metadata_str = ", d.metadata = $metadata"
+                    metadata_params["metadata"] = metadata
+                
+                query = f"""
+                MERGE (d:Document {{id: $document_id}})
                 SET d.title = $title,
                     d.source_path = $source_path,
                     d.document_type = $document_type,
-                    d.created_at = datetime(),
-                    d.metadata = $metadata
+                    d.created_at = datetime()
+                    {metadata_str}
                 RETURN d
                 """
                 
-                result = await session.run(query, {
+                params = {
                     "document_id": document_id,
                     "title": title or "Untitled",
                     "source_path": source_path,
                     "document_type": document_type,
-                    "metadata": metadata or {}
-                })
+                }
+                params.update(metadata_params)
                 
+                result = await session.run(query, params)
+                
+                # Consume the result to ensure the query is executed
+                await result.consume()
                 return True
                 
         except Exception as e:
@@ -111,32 +122,43 @@ class Neo4jManager:
             return False
             
     async def create_entity(self, entity_id: str, name: str, entity_type: str,
-                          document_id: str, properties: Dict[str, Any] = None,
+                          document_id: str, properties: Optional[Dict[str, Any]] = None,
                           confidence: float = 0.0) -> bool:
         """Create an entity node and link it to a document."""
         try:
             async with self.driver.session() as session:
-                query = """
-                MATCH (d:Document {id: $document_id})
-                MERGE (e:Entity {id: $entity_id})
+                # Handle properties properly - Neo4j doesn't like empty maps
+                properties_str = ""
+                properties_params = {}
+                if properties and len(properties) > 0:
+                    properties_str = ", e.properties = $properties"
+                    properties_params["properties"] = properties
+                
+                query = f"""
+                MATCH (d:Document {{id: $document_id}})
+                MERGE (e:Entity {{id: $entity_id}})
                 SET e.name = $name,
                     e.type = $entity_type,
                     e.confidence = $confidence,
-                    e.properties = $properties,
                     e.created_at = datetime()
+                    {properties_str}
                 MERGE (e)-[:MENTIONED_IN]->(d)
                 RETURN e
                 """
                 
-                await session.run(query, {
+                params = {
                     "entity_id": entity_id,
                     "name": name,
                     "entity_type": entity_type,
                     "document_id": document_id,
-                    "properties": properties or {},
                     "confidence": confidence
-                })
+                }
+                params.update(properties_params)
                 
+                result = await session.run(query, params)
+                
+                # Consume the result to ensure the query is executed
+                await result.consume()
                 return True
                 
         except Exception as e:
@@ -145,32 +167,43 @@ class Neo4jManager:
             
     async def create_relationship(self, source_entity_id: str, target_entity_id: str,
                                 relationship_type: str, document_id: str,
-                                properties: Dict[str, Any] = None,
+                                properties: Optional[Dict[str, Any]] = None,
                                 confidence: float = 0.0) -> bool:
         """Create a relationship between two entities."""
         try:
             async with self.driver.session() as session:
-                query = """
-                MATCH (source:Entity {id: $source_entity_id})
-                MATCH (target:Entity {id: $target_entity_id})
-                MATCH (d:Document {id: $document_id})
-                MERGE (source)-[r:RELATES_TO {type: $relationship_type}]->(target)
+                # Handle properties properly - Neo4j doesn't like empty maps
+                properties_str = ""
+                properties_params = {}
+                if properties and len(properties) > 0:
+                    properties_str = ", r.properties = $properties"
+                    properties_params["properties"] = properties
+                
+                query = f"""
+                MATCH (source:Entity {{id: $source_entity_id}})
+                MATCH (target:Entity {{id: $target_entity_id}})
+                MATCH (d:Document {{id: $document_id}})
+                MERGE (source)-[r:RELATES_TO {{type: $relationship_type}}]->(target)
                 SET r.confidence = $confidence,
-                    r.properties = $properties,
                     r.document_id = $document_id,
                     r.created_at = datetime()
+                    {properties_str}
                 RETURN r
                 """
                 
-                await session.run(query, {
+                params = {
                     "source_entity_id": source_entity_id,
                     "target_entity_id": target_entity_id,
                     "relationship_type": relationship_type,
                     "document_id": document_id,
-                    "properties": properties or {},
                     "confidence": confidence
-                })
+                }
+                params.update(properties_params)
                 
+                result = await session.run(query, params)
+                
+                # Consume the result to ensure the query is executed
+                await result.consume()
                 return True
                 
         except Exception as e:
