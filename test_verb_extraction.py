@@ -4,8 +4,10 @@ Test the new verb-focused extraction approach.
 
 import asyncio
 from datetime import datetime
+
 from src.akg.agents.extraction import EntityExtractionAgent
 from src.akg.models import Document
+
 
 async def test_verb_focused_extraction():
     # Test document with lots of action verbs
@@ -46,10 +48,10 @@ async def test_verb_focused_extraction():
         created_at=datetime.now()
     )
     
-    print("🧪 TESTING VERB-FOCUSED EXTRACTION")
+    print("🧪 TESTING VERB-FOCUSED EXTRACTION (with Supabase fallback)")
     print("=" * 60)
     
-    extractor = EntityExtractionAgent()
+    extractor = EntityExtractionAgent(supabase_manager=None)  # Test without Supabase
     entities, relationships = await extractor.extract_entities_and_relationships(doc)
     
     print(f"\n📊 EXTRACTION RESULTS:")

@@ -226,6 +226,223 @@ class SupabaseManager:
         except Exception as e:
             logger.error(f"Failed to log system event: {e}")
     
+    # Domain-specific type management methods
+    
+    async def store_domain_entity_type(self, domain: str, entity_type: str, 
+                                     subdomain: Optional[str] = None,
+                                     description: Optional[str] = None,
+                                     confidence_score: float = 0.0,
+                                     source: str = 'document_analysis',
+                                     metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Store or update a domain-specific entity type."""
+        if not self.client:
+            raise RuntimeError("Supabase client not initialized")
+        
+        # Check if type already exists
+        existing = self.client.table('domain_entity_types').select('*').eq('domain', domain).eq('entity_type', entity_type)
+        if subdomain:
+            existing = existing.eq('subdomain', subdomain)
+        else:
+            existing = existing.is_('subdomain', 'null')
+        
+        existing_result = existing.execute()
+        
+        if existing_result.data:
+            # Update existing record (increment usage count)
+            existing_record = existing_result.data[0]
+            update_data = {
+                'usage_count': existing_record['usage_count'] + 1,
+                'confidence_score': max(existing_record['confidence_score'], confidence_score),
+                'updated_at': datetime.utcnow().isoformat()
+            }
+            if description and not existing_record['description']:
+                update_data['description'] = description
+            if metadata:
+                update_data['metadata'] = json.dumps(metadata)
+            
+            result = self.client.table('domain_entity_types').update(update_data).eq('id', existing_record['id']).execute()
+            return len(result.data) > 0
+        else:
+            # Insert new record
+            insert_data = {
+                'domain': domain,
+                'subdomain': subdomain,
+                'entity_type': entity_type,
+                'description': description,
+                'usage_count': 1,
+                'confidence_score': confidence_score,
+                'source': source,
+                'metadata': json.dumps(metadata) if metadata else None
+            }
+            
+            result = self.client.table('domain_entity_types').insert(insert_data).execute()
+            return len(result.data) > 0
+    
+    async def store_domain_relationship_type(self, domain: str, relationship_type: str,
+                                           source_verb: Optional[str] = None,
+                                           subdomain: Optional[str] = None,
+                                           description: Optional[str] = None,
+                                           confidence_score: float = 0.0,
+                                           source: str = 'document_analysis',
+                                           metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Store or update a domain-specific relationship type."""
+        if not self.client:
+            raise RuntimeError("Supabase client not initialized")
+        
+        # Check if type already exists
+        existing = self.client.table('domain_relationship_types').select('*').eq('domain', domain).eq('relationship_type', relationship_type)
+        if subdomain:
+            existing = existing.eq('subdomain', subdomain)
+        else:
+            existing = existing.is_('subdomain', 'null')
+        
+        existing_result = existing.execute()
+        
+        if existing_result.data:
+            # Update existing record (increment usage count)
+            existing_record = existing_result.data[0]
+            update_data = {
+                'usage_count': existing_record['usage_count'] + 1,
+                'confidence_score': max(existing_record['confidence_score'], confidence_score),
+                'updated_at': datetime.utcnow().isoformat()
+            }
+            if description and not existing_record['description']:
+                update_data['description'] = description
+            if source_verb and not existing_record['source_verb']:
+                update_data['source_verb'] = source_verb
+            if metadata:
+                update_data['metadata'] = json.dumps(metadata)
+            
+            result = self.client.table('domain_relationship_types').update(update_data).eq('id', existing_record['id']).execute()
+            return len(result.data) > 0
+        else:
+            # Insert new record
+            insert_data = {
+                'domain': domain,
+                'subdomain': subdomain,
+                'relationship_type': relationship_type,
+                'source_verb': source_verb,
+                'description': description,
+                'usage_count': 1,
+                'confidence_score': confidence_score,
+                'source': source,
+                'metadata': json.dumps(metadata) if metadata else None
+            }
+            
+            result = self.client.table('domain_relationship_types').insert(insert_data).execute()
+            return len(result.data) > 0
+    
+    async def get_domain_entity_types(self, domain: str, subdomain: Optional[str] = None,
+                                    limit: int = 100) -> List[Dict[str, Any]]:
+        """Get entity types for a specific domain."""
+        if not self.client:
+            raise RuntimeError("Supabase client not initialized")
+        
+        query = self.client.table('domain_entity_types').select('*').eq('domain', domain)
+        if subdomain:
+            query = query.eq('subdomain', subdomain)
+        
+        query = query.order('usage_count', desc=True).order('confidence_score', desc=True).limit(limit)
+        result = query.execute()
+        return result.data
+    
+    async def get_domain_relationship_types(self, domain: str, subdomain: Optional[str] = None,
+                                          limit: int = 100) -> List[Dict[str, Any]]:
+        """Get relationship types for a specific domain."""
+        if not self.client:
+            raise RuntimeError("Supabase client not initialized")
+        
+        query = self.client.table('domain_relationship_types').select('*').eq('domain', domain)
+        if subdomain:
+            query = query.eq('subdomain', subdomain)
+        
+        query = query.order('usage_count', desc=True).order('confidence_score', desc=True).limit(limit)
+        result = query.execute()
+        return result.data
+    
+    async def store_domain_analysis_cache(self, content_hash: str, analysis_data: Dict[str, Any]) -> bool:
+        """Cache document analysis results."""
+        if not self.client:
+            raise RuntimeError("Supabase client not initialized")
+        
+        cache_data = {
+            'content_hash': content_hash,
+            'document_type': analysis_data.get('document_type'),
+            'domain': analysis_data.get('domain'),
+            'subdomain': analysis_data.get('subdomain'),
+            'description': analysis_data.get('description'),
+            'key_entity_types': json.dumps(analysis_data.get('key_entity_types', [])),
+            'key_relationship_types': json.dumps(analysis_data.get('key_relationship_types', [])),
+            'structural_elements': json.dumps(analysis_data.get('structural_elements', [])),
+            'content_focus': analysis_data.get('content_focus'),
+            'confidence': analysis_data.get('confidence', 0.0),
+            'analysis_method': analysis_data.get('analysis_method', 'ai_generated'),
+            'metadata': json.dumps(analysis_data.get('metadata', {}))
+        }
+        
+        # Use upsert to handle duplicates
+        result = self.client.table('domain_analysis_cache').upsert(cache_data, on_conflict='content_hash').execute()
+        return len(result.data) > 0
+    
+    async def get_domain_analysis_cache(self, content_hash: str) -> Optional[Dict[str, Any]]:
+        """Get cached document analysis results."""
+        if not self.client:
+            raise RuntimeError("Supabase client not initialized")
+        
+        result = self.client.table('domain_analysis_cache').select('*').eq('content_hash', content_hash).execute()
+        if result.data:
+            cached = result.data[0]
+            # Parse JSON fields back
+            cached['key_entity_types'] = json.loads(cached['key_entity_types'])
+            cached['key_relationship_types'] = json.loads(cached['key_relationship_types'])
+            cached['structural_elements'] = json.loads(cached['structural_elements'])
+            cached['metadata'] = json.loads(cached['metadata']) if cached['metadata'] else {}
+            return cached
+        return None
+    
+    async def store_verb_extraction(self, document_id: str, original_verb: str,
+                                  normalized_relationship: str, context_snippet: str,
+                                  domain: Optional[str] = None, confidence_score: float = 0.0,
+                                  extraction_method: str = 'regex',
+                                  metadata: Optional[Dict[str, Any]] = None) -> bool:
+        """Store verb extraction results for analysis."""
+        if not self.client:
+            raise RuntimeError("Supabase client not initialized")
+        
+        extraction_data = {
+            'document_id': document_id,
+            'original_verb': original_verb,
+            'normalized_relationship': normalized_relationship,
+            'context_snippet': context_snippet[:500],  # Limit context length
+            'domain': domain,
+            'confidence_score': confidence_score,
+            'extraction_method': extraction_method,
+            'metadata': json.dumps(metadata) if metadata else None
+        }
+        
+        result = self.client.table('verb_extractions').insert(extraction_data).execute()
+        return len(result.data) > 0
+    
+    async def get_domain_statistics(self) -> Dict[str, Any]:
+        """Get statistics about domain-specific types."""
+        if not self.client:
+            raise RuntimeError("Supabase client not initialized")
+        
+        # Get domain type statistics
+        stats_result = self.client.table('domain_type_statistics').select('*').execute()
+        
+        # Get total counts
+        entity_count = self.client.table('domain_entity_types').select('*').execute()
+        relationship_count = self.client.table('domain_relationship_types').select('*').execute()
+        verb_count = self.client.table('verb_extractions').select('*').execute()
+        
+        return {
+            'domain_statistics': stats_result.data,
+            'total_entity_types': len(entity_count.data) if entity_count.data else 0,
+            'total_relationship_types': len(relationship_count.data) if relationship_count.data else 0,
+            'total_verb_extractions': len(verb_count.data) if verb_count.data else 0
+        }
+
     async def close(self):
         """Close the Supabase connection."""
         # Supabase doesn't require explicit closing

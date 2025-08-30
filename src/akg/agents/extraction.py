@@ -2,6 +2,7 @@
 Entity and relationship extraction agent using Google Gemini with fallback to pattern matching.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -25,8 +26,9 @@ console = Console()
 class EntityExtractionAgent:
     """Agent responsible for extracting entities and relationships using Google Gemini with fallback."""
     
-    def __init__(self, neo4j_manager=None):
+    def __init__(self, neo4j_manager=None, supabase_manager=None):
         self.neo4j_manager = neo4j_manager
+        self.supabase_manager = supabase_manager
         self.model = None
         self.fallback_extractor = FallbackEntityExtractor()
         self.type_manager = TypeManager(neo4j_manager=neo4j_manager)
@@ -154,11 +156,26 @@ class EntityExtractionAgent:
 
     async def _analyze_document_nature(self, document: Document) -> Dict[str, Any]:
         """Analyze the document to understand its nature, domain, and content characteristics."""
+        
+        # Create content hash for caching
+        content_hash = hashlib.md5(f"{document.title}:{document.content[:2000]}".encode()).hexdigest()
+        
+        # Check Supabase cache first
+        if self.supabase_manager:
+            try:
+                cached_analysis = await self.supabase_manager.get_domain_analysis_cache(content_hash)
+                if cached_analysis:
+                    logger.info(f"📋 Using cached document analysis for {document.title}")
+                    return cached_analysis
+            except Exception as e:
+                logger.warning(f"Failed to get cached analysis: {e}")
+        
+        # Perform fresh analysis
         if not self.model:
             # Fallback analysis based on simple heuristics
-            return self._fallback_document_analysis(document)
-        
-        analysis_prompt = f"""
+            analysis_data = self._fallback_document_analysis(document)
+        else:
+            analysis_prompt = f"""
 Analyze this document to understand its nature and domain. Based on the title, content preview, and structure, determine:
 
 DOCUMENT TITLE: {document.title}
@@ -186,20 +203,55 @@ Respond with valid JSON only:
   "content_focus": "main focus description"
 }}
 """
+            
+            try:
+                response = self.model.generate_content(analysis_prompt)
+                analysis_data = json.loads(response.text.strip())
+                
+                # Validate and add confidence
+                analysis_data['confidence'] = 0.9
+                analysis_data['analysis_method'] = 'ai_generated'
+                
+            except Exception as e:
+                logger.warning(f"AI document analysis failed: {e}, using fallback")
+                analysis_data = self._fallback_document_analysis(document)
         
-        try:
-            response = self.model.generate_content(analysis_prompt)
-            analysis_data = json.loads(response.text.strip())
-            
-            # Validate and add confidence
-            analysis_data['confidence'] = 0.9
-            analysis_data['analysis_method'] = 'ai_generated'
-            
-            return analysis_data
-            
-        except Exception as e:
-            logger.warning(f"AI document analysis failed: {e}, using fallback")
-            return self._fallback_document_analysis(document)
+        # Store domain types in Supabase if available
+        if self.supabase_manager and analysis_data:
+            try:
+                # Cache the analysis
+                analysis_data['document_type'] = document.document_type
+                await self.supabase_manager.store_domain_analysis_cache(content_hash, analysis_data)
+                
+                # Store domain-specific entity types
+                domain = analysis_data.get('domain', 'general')
+                subdomain = analysis_data.get('subdomain')
+                
+                for entity_type in analysis_data.get('key_entity_types', []):
+                    await self.supabase_manager.store_domain_entity_type(
+                        domain=domain,
+                        subdomain=subdomain,
+                        entity_type=entity_type,
+                        confidence_score=analysis_data.get('confidence', 0.0),
+                        source='document_analysis'
+                    )
+                
+                # Store domain-specific relationship types
+                for rel_type in analysis_data.get('key_relationship_types', []):
+                    await self.supabase_manager.store_domain_relationship_type(
+                        domain=domain,
+                        subdomain=subdomain,
+                        relationship_type=rel_type,
+                        confidence_score=analysis_data.get('confidence', 0.0),
+                        source='document_analysis'
+                    )
+                
+                logger.info(f"💾 Stored domain types for {domain} in Supabase")
+                
+            except Exception as e:
+                logger.warning(f"Failed to store domain analysis in Supabase: {e}")
+        
+        return analysis_data
 
     def _fallback_document_analysis(self, document: Document) -> Dict[str, Any]:
         """Fallback document analysis using simple heuristics."""
@@ -458,7 +510,7 @@ Only respond with valid JSON. Focus on {domain}-specific, comprehensive extracti
                             
                             # Determine relationship type based on domain and context
                             rel_type = self._infer_domain_relationship_from_context(
-                                context, entity1, entity2, domain
+                                context, entity1, entity2, domain, document.id
                             )
                             if rel_type:
                                 relationship = Relationship(
@@ -483,13 +535,13 @@ Only respond with valid JSON. Focus on {domain}-specific, comprehensive extracti
         return relationships
 
     def _infer_domain_relationship_from_context(self, context: str, entity1: Entity, entity2: Entity, 
-                                              domain: str) -> Optional[str]:
+                                              domain: str, document_id: Optional[str] = None) -> Optional[str]:
         """Infer relationship type from context by extracting actual verbs from the text."""
         context = context.lower()
         
         # First, try to extract actual verbs from the context
         import re
-        
+
         # Look for verb patterns between the entities
         entity1_name = entity1.name.lower()
         entity2_name = entity2.name.lower()
@@ -502,12 +554,16 @@ Only respond with valid JSON. Focus on {domain}-specific, comprehensive extracti
             rf'(\w+)\s+{re.escape(entity2_name)}\s+.*?{re.escape(entity1_name)}'
         ]
         
+        extracted_verb = None
+        normalized_relationship = None
+        
         for pattern in verb_patterns:
             matches = re.findall(pattern, context, re.IGNORECASE)
             for match in matches:
                 verb = match.strip()
                 # Convert common verbs to relationship format
                 if len(verb) > 2 and not verb in ['the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with']:
+                    extracted_verb = verb
                     # Convert to uppercase relationship format
                     relationship = verb.upper().replace(' ', '_')
                     # Add common verb transformations
@@ -518,7 +574,47 @@ Only respond with valid JSON. Focus on {domain}-specific, comprehensive extracti
                     elif relationship.endswith('ED'):
                         relationship = relationship[:-2]  # "created" -> "CREAT" -> "CREATE"
                     
-                    return relationship
+                    normalized_relationship = relationship
+                    
+                    # Store verb extraction in Supabase if available
+                    if self.supabase_manager and document_id:
+                        try:
+                            import asyncio
+
+                            # Use asyncio to run async function from sync context
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            loop.run_until_complete(
+                                self.supabase_manager.store_verb_extraction(
+                                    document_id=document_id,
+                                    original_verb=extracted_verb,
+                                    normalized_relationship=normalized_relationship,
+                                    context_snippet=context[:500],
+                                    domain=domain,
+                                    confidence_score=0.8,
+                                    extraction_method='regex'
+                                )
+                            )
+                            loop.close()
+                            
+                            # Also store as domain relationship type
+                            loop = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop)
+                            loop.run_until_complete(
+                                self.supabase_manager.store_domain_relationship_type(
+                                    domain=domain,
+                                    relationship_type=normalized_relationship,
+                                    source_verb=extracted_verb,
+                                    confidence_score=0.8,
+                                    source='verb_extraction'
+                                )
+                            )
+                            loop.close()
+                            
+                        except Exception as e:
+                            logger.warning(f"Failed to store verb extraction: {e}")
+                    
+                    return normalized_relationship
         
         # Fallback to domain-specific patterns if no verbs found
         domain_patterns = {
