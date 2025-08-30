@@ -262,4 +262,4 @@ checkpoints/
 api_keys.txt
 credentials.json
 
-documents/*
+documents/
