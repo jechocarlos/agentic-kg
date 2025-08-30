@@ -237,8 +237,8 @@ class Neo4jManager:
                         properties_str = ", " + ", ".join(prop_setters)
                 
                 # Create relationship with the actual relationship type
-                # Clean the relationship type to be a valid Cypher identifier
-                clean_rel_type = relationship_type.replace(" ", "_").replace("-", "_")
+                # Clean the relationship type to be a valid Cypher identifier and convert to ALL CAPS
+                clean_rel_type = relationship_type.replace(" ", "_").replace("-", "_").upper()
                 
                 query = f"""
                 MATCH (source:Entity {{id: $source_entity_id}})
@@ -546,3 +546,20 @@ class Neo4jManager:
         except Exception as e:
             logger.error(f"Error finding similar entities: {e}")
             return []
+
+    async def clear_all_data(self) -> bool:
+        """Clear all data from the Neo4j database."""
+        try:
+            async with self.driver.session() as session:
+                logger.info("🗑️ Clearing all relationships...")
+                await session.run("MATCH ()-[r]-() DELETE r")
+                
+                logger.info("🗑️ Clearing all nodes...")
+                await session.run("MATCH (n) DELETE n")
+                
+                logger.info("✅ Database cleared successfully!")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Error clearing database: {e}")
+            return False

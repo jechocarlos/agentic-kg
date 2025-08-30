@@ -43,7 +43,7 @@ class EntityExtractionAgent:
             raise
     
     async def extract_entities_and_relationships(self, document: Document) -> Tuple[List[Entity], List[Relationship]]:
-        """Extract entities and relationships from a document using Gemini with fallback."""
+        """Extract entities and relationships from a document using chunked processing and SPO triples."""
         logger.info(f"🧠 Extracting entities from: {document.title}")
         
         # Refresh type cache to get latest types from Neo4j
@@ -53,44 +53,89 @@ class EntityExtractionAgent:
         stats = self.type_manager.get_type_statistics()
         logger.info(f"📊 Type manager loaded: {stats['entity_types_count']} entity types, {stats['relationship_types_count']} relationship types")
         
-        # Try Gemini first
-        if self.model:
-            try:
-                # Create the extraction prompt with dynamic types from cache
-                existing_entity_types = list(self.type_manager._entity_types_cache)
-                existing_relationship_types = list(self.type_manager._relationship_types_cache)
-                
-                prompt = self._create_extraction_prompt(document, existing_entity_types, existing_relationship_types)
-                
-                # Get response from Gemini
-                response = self.model.generate_content(prompt)
-                
-                # Parse the response with type resolution
-                entities, relationships = await self._parse_gemini_response_with_type_resolution(response.text, document.id)
-                
-                logger.info(f"✅ Extracted {len(entities)} entities and {len(relationships)} relationships using Gemini")
-                return entities, relationships
-                
-            except Exception as e:
-                logger.warning(f"⚠️ Gemini extraction failed for {document.title}: {e}")
-                logger.info("🔄 Falling back to pattern-based extraction...")
-        else:
-            logger.warning("❌ Gemini model not available, using fallback extraction")
+        # Chunk the document for more granular extraction
+        chunks = self._chunk_document(document)
+        logger.info(f"📄 Document chunked into {len(chunks)} segments for processing")
         
-        # Fallback to pattern-based extraction
-        try:
-            entities = self.fallback_extractor.extract_entities(document)
-            relationships = self.fallback_extractor.extract_relationships(entities, document)
+        all_entities = []
+        all_relationships = []
+        
+        # Process each chunk separately for better granularity
+        for i, chunk in enumerate(chunks):
+            logger.info(f"🔄 Processing chunk {i+1}/{len(chunks)}")
             
-            # Apply type resolution to fallback results too
-            entities, relationships = await self._apply_type_resolution_to_fallback(entities, relationships)
-            
-            logger.info(f"✅ Extracted {len(entities)} entities and {len(relationships)} relationships using fallback")
-            return entities, relationships
-            
-        except Exception as e:
-            logger.error(f"❌ Both Gemini and fallback extraction failed for {document.title}: {e}")
-            return [], []
+            # Try Gemini first
+            if self.model:
+                try:
+                    # Create the extraction prompt with dynamic types from cache
+                    existing_entity_types = list(self.type_manager._entity_types_cache)
+                    existing_relationship_types = list(self.type_manager._relationship_types_cache)
+                    
+                    prompt = self._create_spo_extraction_prompt(chunk, existing_entity_types, existing_relationship_types, document.title)
+                    
+                    # Get response from Gemini
+                    response = self.model.generate_content(prompt)
+                    
+                    # Parse the response with type resolution
+                    entities, relationships = await self._parse_gemini_response_with_type_resolution(response.text, document.id)
+                    
+                    all_entities.extend(entities)
+                    all_relationships.extend(relationships)
+                    
+                    logger.info(f"✅ Chunk {i+1}: Extracted {len(entities)} entities and {len(relationships)} relationships")
+                    
+                except Exception as e:
+                    logger.warning(f"⚠️ Gemini extraction failed for chunk {i+1}: {e}")
+                    logger.info("🔄 Falling back to pattern-based extraction for this chunk...")
+                    
+                    # Fallback for this chunk
+                    chunk_doc = Document(
+                        id=f"{document.id}_chunk_{i}",
+                        title=f"{document.title} (Chunk {i+1})",
+                        content=chunk,
+                        source_system=document.source_system,
+                        source_path=document.source_path,
+                        document_type=document.document_type,
+                        metadata=document.metadata,
+                        created_at=document.created_at
+                    )
+                    entities = self.fallback_extractor.extract_entities(chunk_doc)
+                    relationships = self.fallback_extractor.extract_relationships(entities, chunk_doc)
+                    
+                    # Apply type resolution to fallback results
+                    entities, relationships = await self._apply_type_resolution_to_fallback(entities, relationships)
+                    
+                    all_entities.extend(entities)
+                    all_relationships.extend(relationships)
+            else:
+                logger.warning("❌ Gemini model not available, using fallback extraction")
+                
+                # Fallback for this chunk
+                chunk_doc = Document(
+                    id=f"{document.id}_chunk_{i}",
+                    title=f"{document.title} (Chunk {i+1})",
+                    content=chunk,
+                    source_system=document.source_system,
+                    source_path=document.source_path,
+                    document_type=document.document_type,
+                    metadata=document.metadata,
+                    created_at=document.created_at
+                )
+                entities = self.fallback_extractor.extract_entities(chunk_doc)
+                relationships = self.fallback_extractor.extract_relationships(entities, chunk_doc)
+                
+                # Apply type resolution to fallback results
+                entities, relationships = await self._apply_type_resolution_to_fallback(entities, relationships)
+                
+                all_entities.extend(entities)
+                all_relationships.extend(relationships)
+        
+        # Deduplicate entities and relationships
+        all_entities = self._deduplicate_entities(all_entities)
+        all_relationships = self._deduplicate_relationships(all_relationships)
+        
+        logger.info(f"✅ Total extracted: {len(all_entities)} entities and {len(all_relationships)} relationships from {len(chunks)} chunks")
+        return all_entities, all_relationships
     
     def _create_extraction_prompt(self, document: Document, existing_entity_types: Optional[List[str]] = None, existing_relationship_types: Optional[List[str]] = None) -> str:
         """Create a structured prompt for entity extraction with dynamic types from existing database."""
@@ -437,3 +482,150 @@ Only respond with valid JSON. Do not include any other text.
         logger.info(f"📊 Total extracted: {total_entities} entities, {total_relationships} relationships")
         
         return results
+
+    def _chunk_document(self, document: Document, chunk_size: int = 2000, overlap: int = 200) -> List[str]:
+        """Chunk a document into smaller segments for processing."""
+        content = document.content
+        
+        # If document is small enough, return as single chunk
+        if len(content) <= chunk_size:
+            return [content]
+        
+        chunks = []
+        start = 0
+        
+        while start < len(content):
+            # Find end of chunk
+            end = start + chunk_size
+            
+            # If this isn't the last chunk, try to break at a sentence boundary
+            if end < len(content):
+                # Look for sentence endings within the last 200 characters
+                sentence_ends = ['.', '!', '?', '\n\n']
+                best_break = -1
+                
+                for i in range(max(start + chunk_size - 200, start), min(end, len(content))):
+                    if content[i] in sentence_ends and i > start:
+                        best_break = i + 1
+                
+                if best_break > -1:
+                    end = best_break
+            
+            chunk = content[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            
+            # Move start forward, accounting for overlap
+            start = max(end - overlap, start + 1)
+            if start >= len(content):
+                break
+        
+        return chunks
+
+    def _create_spo_extraction_prompt(self, chunk: str, existing_entity_types: Optional[List[str]] = None, 
+                                    existing_relationship_types: Optional[List[str]] = None, 
+                                    document_title: str = "") -> str:
+        """Create a SUBJECT-PREDICATE-OBJECT focused extraction prompt."""
+        
+        # Build type guidance based on what's actually in the database
+        entity_type_guidance = ""
+        if existing_entity_types and len(existing_entity_types) > 0:
+            entity_type_guidance = f"\nExisting entity types: {', '.join(sorted(existing_entity_types))}"
+            entity_type_guidance += "\nReuse these types when appropriate, or create new ones."
+        else:
+            entity_type_guidance = "\nCreate appropriate entity types based on the content."
+        
+        relationship_type_guidance = ""
+        if existing_relationship_types and len(existing_relationship_types) > 0:
+            relationship_type_guidance = f"\nExisting relationship types: {', '.join(sorted(existing_relationship_types))}"
+            relationship_type_guidance += "\nReuse these types when appropriate, or create new ones."
+        else:
+            relationship_type_guidance = "\nCreate appropriate relationship types based on the content."
+        
+        prompt = f"""
+You are an expert knowledge graph builder. Extract SUBJECT-PREDICATE-OBJECT triples from this document chunk.
+
+DOCUMENT: {document_title}
+CONTENT CHUNK:
+{chunk}
+
+TYPE GUIDANCE:
+{entity_type_guidance}
+{relationship_type_guidance}
+
+INSTRUCTIONS:
+1. Identify entities (SUBJECTS and OBJECTS) - people, organizations, concepts, dates, locations, etc.
+2. Identify relationships (PREDICATES) between entities - actions, associations, properties, etc.
+3. Extract explicit relationships stated in the text
+4. Infer reasonable relationships from context
+5. Use ALL CAPS for relationship types (e.g., WORKS_FOR, FOUNDED_BY, LOCATED_IN)
+6. Be granular - create specific relationship types rather than generic ones
+7. Include confidence scores (0.0-1.0) based on certainty
+8. Add properties for additional context
+
+RELATIONSHIP TYPE EXAMPLES:
+- WORKS_FOR, EMPLOYED_BY, MANAGES, REPORTS_TO
+- FOUNDED, ESTABLISHED, CREATED, DEVELOPED  
+- LOCATED_IN, BASED_IN, OPERATES_IN, HEADQUARTERED_IN
+- PARTNERED_WITH, COLLABORATED_WITH, ACQUIRED, MERGED_WITH
+- ATTENDED, GRADUATED_FROM, STUDIED_AT, TAUGHT_AT
+- MENTIONED_IN, DISCUSSED_IN, REFERENCED_BY, DESCRIBED_IN
+- SCHEDULED_FOR, OCCURRED_ON, PLANNED_FOR, COMPLETED_ON
+
+RESPONSE FORMAT (JSON only):
+{{
+  "entities": [
+    {{
+      "name": "Entity Name",
+      "type": "ENTITY_TYPE",
+      "aliases": ["alias1", "alias2"],
+      "properties": {{"description": "brief description", "category": "subcategory"}},
+      "confidence": 0.9
+    }}
+  ],
+  "relationships": [
+    {{
+      "source_entity": "Subject Entity",
+      "target_entity": "Object Entity", 
+      "type": "PREDICATE_TYPE",
+      "properties": {{"context": "additional context", "timeframe": "when applicable"}},
+      "confidence": 0.8
+    }}
+  ]
+}}
+
+Only respond with valid JSON. Focus on creating granular, specific relationships.
+"""
+        return prompt
+
+    def _deduplicate_entities(self, entities: List[Entity]) -> List[Entity]:
+        """Remove duplicate entities based on name and type."""
+        seen = set()
+        deduplicated = []
+        
+        for entity in entities:
+            key = (entity.name.lower().strip(), entity.entity_type.upper())
+            if key not in seen:
+                seen.add(key)
+                deduplicated.append(entity)
+        
+        logger.info(f"🔄 Deduplicated entities: {len(entities)} → {len(deduplicated)}")
+        return deduplicated
+
+    def _deduplicate_relationships(self, relationships: List[Relationship]) -> List[Relationship]:
+        """Remove duplicate relationships based on source, target, and type."""
+        seen = set()
+        deduplicated = []
+        
+        for rel in relationships:
+            # Create a key based on the relationship components
+            source_name = getattr(rel, 'source_entity_name', rel.source_entity_id)
+            target_name = getattr(rel, 'target_entity_name', rel.target_entity_id) 
+            key = (source_name.lower().strip(), target_name.lower().strip(), rel.relationship_type.upper())
+            
+            if key not in seen:
+                seen.add(key)
+                deduplicated.append(rel)
+        
+        logger.info(f"🔄 Deduplicated relationships: {len(relationships)} → {len(deduplicated)}")
+        return deduplicated

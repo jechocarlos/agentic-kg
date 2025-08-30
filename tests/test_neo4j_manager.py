@@ -355,7 +355,7 @@ class TestNeo4jManager:
         def run_side_effect(query, *args, **kwargs):
             if "MATCH (e:Entity)" in query:
                 return mock_entity_result
-            elif "MATCH ()-[r:RELATES_TO]->()" in query:
+            elif "MATCH ()-[r]->()" in query:
                 return mock_rel_result
             elif "MATCH (d:Document)" in query:
                 return mock_doc_result

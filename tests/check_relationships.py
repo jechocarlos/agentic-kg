@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 # Add src to path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from akg.config import AKGConfig
 from akg.database.neo4j_manager import Neo4jManager
@@ -16,12 +16,7 @@ from akg.database.neo4j_manager import Neo4jManager
 
 async def check_relationships():
     """Check what relationships exist in the Neo4j database."""
-    config = AKGConfig()
-    neo4j_manager = Neo4jManager(
-        uri=config.neo4j_uri,
-        username=config.neo4j_username,
-        password=config.neo4j_password
-    )
+    neo4j_manager = Neo4jManager()
     
     try:
         # Initialize connection
