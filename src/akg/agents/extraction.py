@@ -4,6 +4,7 @@ Entity and relationship extraction agent using Google Gemini with fallback to pa
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,7 +36,7 @@ class EntityExtractionAgent:
         """Initialize Google Gemini AI model."""
         try:
             genai.configure(api_key=config.google_api_key)
-            self.model = genai.GenerativeModel('gemini-1.5-flash')  # Updated to current model
+            self.model = genai.GenerativeModel('gemini-2.5-flash')  # Updated to current model
             logger.info("✅ Google Gemini initialized successfully")
         except Exception as e:
             logger.error(f"❌ Failed to initialize Google Gemini: {e}")
@@ -43,13 +44,17 @@ class EntityExtractionAgent:
             raise
     
     async def extract_entities_and_relationships(self, document: Document) -> Tuple[List[Entity], List[Relationship]]:
-        """Extract entities and relationships from a document using chunked processing and SPO triples."""
+        """Extract entities and relationships from a document using adaptive, document-driven processing."""
         logger.info(f"🧠 Extracting entities from: {document.title}")
+        
+        # Step 1: Analyze document nature and domain
+        document_analysis = await self._analyze_document_nature(document)
+        logger.info(f"📋 Document analysis: {document_analysis['domain']} - {document_analysis['description']}")
         
         # Refresh type cache to get latest types from Neo4j
         await self.type_manager.refresh_type_cache()
         
-        # Get existing types for better prompting
+        # Get existing types for context (but don't constrain to them)
         stats = self.type_manager.get_type_statistics()
         logger.info(f"📊 Type manager loaded: {stats['entity_types_count']} entity types, {stats['relationship_types_count']} relationship types")
         
@@ -60,18 +65,20 @@ class EntityExtractionAgent:
         all_entities = []
         all_relationships = []
         
-        # Process each chunk separately for better granularity
+        # Process each chunk with document-aware prompting
         for i, chunk in enumerate(chunks):
             logger.info(f"🔄 Processing chunk {i+1}/{len(chunks)}")
             
-            # Try Gemini first
+            # Try Gemini first with adaptive prompting
             if self.model:
                 try:
-                    # Create the extraction prompt with dynamic types from cache
+                    # Create adaptive extraction prompt based on document analysis
                     existing_entity_types = list(self.type_manager._entity_types_cache)
                     existing_relationship_types = list(self.type_manager._relationship_types_cache)
                     
-                    prompt = self._create_spo_extraction_prompt(chunk, existing_entity_types, existing_relationship_types, document.title)
+                    prompt = self._create_adaptive_extraction_prompt(
+                        chunk, document_analysis, existing_entity_types, existing_relationship_types, document.title
+                    )
                     
                     # Get response from Gemini
                     response = self.model.generate_content(prompt)
@@ -88,7 +95,7 @@ class EntityExtractionAgent:
                     logger.warning(f"⚠️ Gemini extraction failed for chunk {i+1}: {e}")
                     logger.info("🔄 Falling back to pattern-based extraction for this chunk...")
                     
-                    # Fallback for this chunk
+                    # Fallback for this chunk with adaptive patterns
                     chunk_doc = Document(
                         id=f"{document.id}_chunk_{i}",
                         title=f"{document.title} (Chunk {i+1})",
@@ -134,8 +141,459 @@ class EntityExtractionAgent:
         all_entities = self._deduplicate_entities(all_entities)
         all_relationships = self._deduplicate_relationships(all_relationships)
         
+        # Discover additional cross-chunk relationships using document-aware patterns
+        if len(chunks) > 1:
+            cross_chunk_relationships = await self._discover_adaptive_cross_chunk_relationships(
+                all_entities, document, document_analysis
+            )
+            all_relationships.extend(cross_chunk_relationships)
+            all_relationships = self._deduplicate_relationships(all_relationships)
+        
         logger.info(f"✅ Total extracted: {len(all_entities)} entities and {len(all_relationships)} relationships from {len(chunks)} chunks")
         return all_entities, all_relationships
+
+    async def _analyze_document_nature(self, document: Document) -> Dict[str, Any]:
+        """Analyze the document to understand its nature, domain, and content characteristics."""
+        if not self.model:
+            # Fallback analysis based on simple heuristics
+            return self._fallback_document_analysis(document)
+        
+        analysis_prompt = f"""
+Analyze this document to understand its nature and domain. Based on the title, content preview, and structure, determine:
+
+DOCUMENT TITLE: {document.title}
+DOCUMENT TYPE: {document.document_type or 'unknown'}
+CONTENT PREVIEW (first 1000 chars):
+{document.content[:1000]}
+
+Please analyze and respond with JSON containing:
+1. domain: The primary domain (technical, business, legal, academic, medical, financial, etc.)
+2. subdomain: More specific classification within the domain
+3. description: Brief description of document nature
+4. key_entity_types: List of 5-10 entity types that would be most relevant for this document
+5. key_relationship_types: List of 10-15 relationship types that would be most relevant for this document
+6. structural_elements: Key structural elements present (headings, lists, tables, etc.)
+7. content_focus: What the document primarily focuses on
+
+Respond with valid JSON only:
+{{
+  "domain": "primary_domain",
+  "subdomain": "specific_subdomain", 
+  "description": "brief description",
+  "key_entity_types": ["TYPE1", "TYPE2", "TYPE3", ...],
+  "key_relationship_types": ["REL_TYPE1", "REL_TYPE2", "REL_TYPE3", ...],
+  "structural_elements": ["headings", "lists", "tables", ...],
+  "content_focus": "main focus description"
+}}
+"""
+        
+        try:
+            response = self.model.generate_content(analysis_prompt)
+            analysis_data = json.loads(response.text.strip())
+            
+            # Validate and add confidence
+            analysis_data['confidence'] = 0.9
+            analysis_data['analysis_method'] = 'ai_generated'
+            
+            return analysis_data
+            
+        except Exception as e:
+            logger.warning(f"AI document analysis failed: {e}, using fallback")
+            return self._fallback_document_analysis(document)
+
+    def _fallback_document_analysis(self, document: Document) -> Dict[str, Any]:
+        """Fallback document analysis using simple heuristics."""
+        content = document.content.lower()
+        title = document.title.lower()
+        
+        # Domain detection based on keywords
+        domain_keywords = {
+            'technical': ['api', 'code', 'function', 'class', 'method', 'algorithm', 'implementation', 'config', 'setup'],
+            'business': ['meeting', 'project', 'budget', 'team', 'manager', 'strategy', 'goal', 'objective'],
+            'legal': ['contract', 'agreement', 'clause', 'term', 'obligation', 'party', 'liability', 'compliance'],
+            'academic': ['research', 'study', 'analysis', 'methodology', 'findings', 'citation', 'paper', 'thesis'],
+            'medical': ['patient', 'diagnosis', 'treatment', 'symptoms', 'medication', 'health', 'clinical'],
+            'financial': ['revenue', 'cost', 'budget', 'investment', 'profit', 'financial', 'accounting']
+        }
+        
+        # Score each domain
+        domain_scores = {}
+        for domain, keywords in domain_keywords.items():
+            score = sum(1 for keyword in keywords if keyword in content or keyword in title)
+            domain_scores[domain] = score
+        
+        # Get primary domain
+        primary_domain = 'general'
+        if domain_scores:
+            primary_domain = max(domain_scores.keys(), key=lambda k: domain_scores[k])
+        
+        # Generate appropriate entity and relationship types based on domain
+        domain_mappings = {
+            'technical': {
+                'entity_types': ['FUNCTION', 'CLASS', 'METHOD', 'VARIABLE', 'API', 'SERVICE', 'COMPONENT', 'MODULE'],
+                'relationship_types': ['CALLS', 'INHERITS_FROM', 'IMPLEMENTS', 'DEPENDS_ON', 'CONFIGURES', 'RETURNS', 'USES', 'EXTENDS']
+            },
+            'business': {
+                'entity_types': ['PERSON', 'PROJECT', 'TEAM', 'DEPARTMENT', 'GOAL', 'TASK', 'BUDGET', 'TIMELINE'],
+                'relationship_types': ['MANAGES', 'WORKS_ON', 'REPORTS_TO', 'ASSIGNED_TO', 'RESPONSIBLE_FOR', 'PARTICIPATES_IN', 'OWNS', 'APPROVES']
+            },
+            'legal': {
+                'entity_types': ['PARTY', 'CONTRACT', 'CLAUSE', 'OBLIGATION', 'RIGHT', 'TERM', 'DATE', 'AMOUNT'],
+                'relationship_types': ['BOUND_BY', 'OBLIGATED_TO', 'ENTITLED_TO', 'GOVERNED_BY', 'REFERS_TO', 'MODIFIES', 'SUPERSEDES', 'EFFECTIVE_FROM']
+            },
+            'academic': {
+                'entity_types': ['AUTHOR', 'PAPER', 'CONCEPT', 'METHODOLOGY', 'FINDING', 'CITATION', 'INSTITUTION', 'JOURNAL'],
+                'relationship_types': ['AUTHORED_BY', 'CITES', 'STUDIES', 'PROPOSES', 'DEMONSTRATES', 'VALIDATES', 'CONTRADICTS', 'BUILDS_ON']
+            },
+            'medical': {
+                'entity_types': ['PATIENT', 'DIAGNOSIS', 'TREATMENT', 'MEDICATION', 'SYMPTOM', 'PROCEDURE', 'DOCTOR', 'CONDITION'],
+                'relationship_types': ['DIAGNOSED_WITH', 'TREATED_WITH', 'PRESCRIBED', 'EXHIBITS', 'PERFORMED_ON', 'INDICATES', 'CAUSES', 'PREVENTS']
+            },
+            'financial': {
+                'entity_types': ['ACCOUNT', 'TRANSACTION', 'AMOUNT', 'BUDGET', 'REVENUE', 'EXPENSE', 'INVESTMENT', 'PORTFOLIO'],
+                'relationship_types': ['DEBITED_FROM', 'CREDITED_TO', 'ALLOCATED_TO', 'GENERATED_BY', 'INVESTED_IN', 'COSTS', 'YIELDS', 'TRANSFERS_TO']
+            }
+        }
+        
+        mapping = domain_mappings.get(primary_domain, domain_mappings['business'])  # Default to business
+        
+        return {
+            'domain': primary_domain,
+            'subdomain': 'general',
+            'description': f'{primary_domain.title()} document with focus on domain-specific entities and relationships',
+            'key_entity_types': mapping['entity_types'],
+            'key_relationship_types': mapping['relationship_types'],
+            'structural_elements': ['text', 'paragraphs'],
+            'content_focus': f'{primary_domain} domain content',
+            'confidence': 0.7,
+            'analysis_method': 'keyword_based'
+        }
+
+    def _create_adaptive_extraction_prompt(self, chunk: str, document_analysis: Dict[str, Any], 
+                                         existing_entity_types: Optional[List[str]] = None,
+                                         existing_relationship_types: Optional[List[str]] = None, 
+                                         document_title: str = "") -> str:
+        """Create an adaptive extraction prompt based on document analysis."""
+        
+        domain = document_analysis.get('domain', 'general')
+        subdomain = document_analysis.get('subdomain', '')
+        key_entity_types = document_analysis.get('key_entity_types', [])
+        key_relationship_types = document_analysis.get('key_relationship_types', [])
+        content_focus = document_analysis.get('content_focus', 'general content')
+        
+        # Build context-aware type guidance
+        entity_type_guidance = f"\nFor this {domain} document focusing on {content_focus}:"
+        entity_type_guidance += f"\nPriority entity types: {', '.join(key_entity_types)}"
+        if existing_entity_types:
+            entity_type_guidance += f"\nExisting types in knowledge base: {', '.join(existing_entity_types[:10])}..."
+        entity_type_guidance += f"\nCreate new types as needed that fit the {domain} domain."
+        
+        relationship_type_guidance = f"\nFor this {domain} document:"
+        relationship_type_guidance += f"\nPriority relationship types: {', '.join(key_relationship_types)}"
+        if existing_relationship_types:
+            relationship_type_guidance += f"\nExisting types in knowledge base: {', '.join(existing_relationship_types[:10])}..."
+        relationship_type_guidance += f"\nCreate new relationships that capture {domain}-specific connections."
+        
+        # Create domain-specific instructions
+        domain_instructions = self._get_domain_specific_instructions(domain, subdomain)
+        
+        prompt = f"""
+You are an expert knowledge graph builder specializing in {domain} domain extraction.
+Extract comprehensive SUBJECT-PREDICATE-OBJECT triples from this {domain} document chunk.
+
+DOCUMENT: {document_title} (Domain: {domain})
+CONTENT CHUNK:
+{chunk}
+
+DOMAIN ANALYSIS:
+{entity_type_guidance}
+{relationship_type_guidance}
+
+DOMAIN-SPECIFIC INSTRUCTIONS:
+{domain_instructions}
+
+UNIVERSAL EXTRACTION PRINCIPLES:
+1. Extract ALL entities relevant to the {domain} domain
+2. For EVERY ACTION WORD/VERB in the text, create a relationship using that verb
+3. Use ACTUAL VERBS from the document: "assigns" → "ASSIGNS", "schedules" → "SCHEDULES", "creates" → "CREATES"
+4. Look for Subject-VERB-Object patterns in every sentence
+5. Focus on {content_focus}
+6. Use domain-appropriate terminology and concepts
+7. Create granular, specific relationship types from the actual text
+8. Include confidence scores (0.0-1.0) based on certainty
+9. Add properties for domain-specific context
+10. Extract 5-10+ relationships per entity minimum - be aggressive!
+
+VERB-TO-RELATIONSHIP CONVERSION EXAMPLES:
+- "Sarah manages the project" → Sarah --[MANAGES]--> Project
+- "Mike will create requirements" → Mike --[WILL_CREATE]--> Requirements  
+- "Team uses React" → Team --[USES]--> React
+- "Budget is allocated to development" → Budget --[ALLOCATED_TO]--> Development
+- "Meeting scheduled for Monday" → Meeting --[SCHEDULED_FOR]--> Monday
+- "Document describes the process" → Document --[DESCRIBES]--> Process
+- "System integrates with database" → System --[INTEGRATES_WITH]--> Database
+
+RESPONSE FORMAT (JSON only):
+{{
+  "entities": [
+    {{
+      "name": "Entity Name",
+      "type": "DOMAIN_APPROPRIATE_TYPE",
+      "aliases": ["alias1", "alias2"],
+      "properties": {{"domain_specific_property": "value", "context": "additional context"}},
+      "confidence": 0.9
+    }}
+  ],
+  "relationships": [
+    {{
+      "source_entity": "Subject Entity",
+      "target_entity": "Object Entity", 
+      "type": "DOMAIN_SPECIFIC_RELATIONSHIP",
+      "properties": {{"context": "domain context", "specifics": "domain-specific details"}},
+      "confidence": 0.8
+    }}
+  ]
+}}
+
+Only respond with valid JSON. Focus on {domain}-specific, comprehensive extraction.
+"""
+        return prompt
+
+    def _get_domain_specific_instructions(self, domain: str, subdomain: str = "") -> str:
+        """Get domain-specific extraction instructions."""
+        
+        instructions = {
+            'technical': """
+- Extract ALL verbs and actions: implements, configures, calls, returns, depends, uses, extends, etc.
+- Look for technical actions: "API calls the service" → API --[CALLS]--> Service
+- Extract implementation details: "Class implements interface" → Class --[IMPLEMENTS]--> Interface
+- Capture dependencies: "Module requires library" → Module --[REQUIRES]--> Library
+- Use actual verbs from the text as relationship types
+            """,
+            
+            'business': """
+- Extract ALL action verbs: manages, assigns, reports, schedules, approves, creates, develops, etc.
+- Look for business actions: "Sarah manages the project" → Sarah --[MANAGES]--> Project
+- Extract assignments: "David creates requirements" → David --[CREATES]--> Requirements
+- Capture responsibilities: "Team reports to manager" → Team --[REPORTS_TO]--> Manager
+- Use actual verbs and phrases from the document
+            """,
+            
+            'legal': """
+- Extract ALL legal actions: binds, governs, modifies, supersedes, requires, entitles, etc.
+- Look for legal relationships: "Contract binds parties" → Contract --[BINDS]--> Parties
+- Extract obligations: "Party agrees to terms" → Party --[AGREES_TO]--> Terms
+- Capture legal effects: "Amendment modifies clause" → Amendment --[MODIFIES]--> Clause
+- Use precise legal language from the document
+            """,
+            
+            'academic': """
+- Extract ALL research actions: studies, demonstrates, proposes, validates, cites, etc.
+- Look for research relationships: "Paper cites study" → Paper --[CITES]--> Study
+- Extract findings: "Research demonstrates effect" → Research --[DEMONSTRATES]--> Effect
+- Capture methodology: "Authors propose method" → Authors --[PROPOSE]--> Method
+- Use academic verbs and terminology from the text
+            """,
+            
+            'medical': """
+- Extract ALL medical actions: diagnoses, treats, prescribes, indicates, causes, prevents, etc.
+- Look for medical relationships: "Doctor prescribes medication" → Doctor --[PRESCRIBES]--> Medication
+- Extract conditions: "Symptom indicates disease" → Symptom --[INDICATES]--> Disease
+- Capture treatments: "Drug treats condition" → Drug --[TREATS]--> Condition
+- Use medical terminology and verbs from the document
+            """,
+            
+            'financial': """
+- Extract ALL financial actions: invests, allocates, generates, costs, transfers, yields, etc.
+- Look for financial flows: "Fund invests in asset" → Fund --[INVESTS_IN]--> Asset
+- Extract transactions: "Account transfers money" → Account --[TRANSFERS]--> Money
+- Capture performance: "Investment yields return" → Investment --[YIELDS]--> Return
+- Use financial verbs and terms from the text
+            """
+        }
+        
+        return instructions.get(domain, """
+- Extract domain-relevant entities and their meaningful relationships
+- Focus on the specific context and purpose of this document type
+- Capture quantitative and qualitative measures relevant to the domain
+- Look for hierarchical, temporal, and causal relationships
+- Extract domain-specific terminology and concepts
+        """).strip()
+
+    async def _discover_adaptive_cross_chunk_relationships(self, entities: List[Entity], document: Document, 
+                                                         document_analysis: Dict[str, Any]) -> List[Relationship]:
+        """Discover additional relationships using document-aware patterns."""
+        relationships = []
+        domain = document_analysis.get('domain', 'general')
+        
+        # Create entity lookup by name for quick matching
+        entity_by_name = {entity.name.lower(): entity for entity in entities}
+        
+        # Look for domain-specific relationship patterns in the full document
+        text = document.content.lower()
+        
+        for i, entity1 in enumerate(entities):
+            for j, entity2 in enumerate(entities[i+1:], i+1):
+                # Skip if entities are the same
+                if entity1.id == entity2.id:
+                    continue
+                
+                # Look for co-occurrence patterns that suggest relationships
+                name1 = entity1.name.lower()
+                name2 = entity2.name.lower()
+                
+                # Find positions where both entities are mentioned
+                name1_positions = [m.start() for m in re.finditer(re.escape(name1), text)]
+                name2_positions = [m.start() for m in re.finditer(re.escape(name2), text)]
+                
+                # Check if entities appear close to each other (within 200 characters)
+                for pos1 in name1_positions:
+                    for pos2 in name2_positions:
+                        distance = abs(pos1 - pos2)
+                        if distance <= 200 and distance > 0:
+                            # Extract the context around both entities
+                            start = max(0, min(pos1, pos2) - 100)
+                            end = min(len(text), max(pos1 + len(name1), pos2 + len(name2)) + 100)
+                            context = text[start:end]
+                            
+                            # Determine relationship type based on domain and context
+                            rel_type = self._infer_domain_relationship_from_context(
+                                context, entity1, entity2, domain
+                            )
+                            if rel_type:
+                                relationship = Relationship(
+                                    id=str(uuid.uuid4()),
+                                    source_entity_id=entity1.id,
+                                    target_entity_id=entity2.id,
+                                    relationship_type=rel_type,
+                                    document_id=document.id,
+                                    properties={
+                                        "context": context.strip(), 
+                                        "cross_chunk": True, 
+                                        "domain": domain,
+                                        "discovery_method": "adaptive_cross_chunk"
+                                    },
+                                    confidence_score=0.6,  # Lower confidence for inferred relationships
+                                    created_at=datetime.utcnow()
+                                )
+                                relationships.append(relationship)
+                                break  # Only create one relationship per entity pair
+        
+        logger.info(f"🔍 Discovered {len(relationships)} additional {domain}-domain cross-chunk relationships")
+        return relationships
+
+    def _infer_domain_relationship_from_context(self, context: str, entity1: Entity, entity2: Entity, 
+                                              domain: str) -> Optional[str]:
+        """Infer relationship type from context by extracting actual verbs from the text."""
+        context = context.lower()
+        
+        # First, try to extract actual verbs from the context
+        import re
+        
+        # Look for verb patterns between the entities
+        entity1_name = entity1.name.lower()
+        entity2_name = entity2.name.lower()
+        
+        # Pattern to find verbs between entities: "entity1 VERB entity2" or "entity1 VERB ... entity2"
+        verb_patterns = [
+            rf'{re.escape(entity1_name)}\s+(\w+(?:\s+\w+)?)\s+.*?{re.escape(entity2_name)}',
+            rf'{re.escape(entity2_name)}\s+(\w+(?:\s+\w+)?)\s+.*?{re.escape(entity1_name)}',
+            rf'(\w+)\s+{re.escape(entity1_name)}\s+.*?{re.escape(entity2_name)}',
+            rf'(\w+)\s+{re.escape(entity2_name)}\s+.*?{re.escape(entity1_name)}'
+        ]
+        
+        for pattern in verb_patterns:
+            matches = re.findall(pattern, context, re.IGNORECASE)
+            for match in matches:
+                verb = match.strip()
+                # Convert common verbs to relationship format
+                if len(verb) > 2 and not verb in ['the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with']:
+                    # Convert to uppercase relationship format
+                    relationship = verb.upper().replace(' ', '_')
+                    # Add common verb transformations
+                    if relationship.endswith('S') and not relationship.endswith('SS'):
+                        relationship = relationship[:-1]  # "creates" -> "CREATE"
+                    elif relationship.endswith('ING'):
+                        relationship = relationship[:-3]  # "creating" -> "CREAT" -> "CREATE"
+                    elif relationship.endswith('ED'):
+                        relationship = relationship[:-2]  # "created" -> "CREAT" -> "CREATE"
+                    
+                    return relationship
+        
+        # Fallback to domain-specific patterns if no verbs found
+        domain_patterns = {
+            'technical': {
+                "CALLS": ["call", "invoke", "execute", "run"],
+                "DEPENDS_ON": ["depend", "require", "need", "import"],
+                "IMPLEMENTS": ["implement", "extend", "inherit"],
+                "CONFIGURES": ["config", "setup", "configure", "initialize"],
+                "RETURNS": ["return", "output", "produce", "yield"],
+                "USES": ["use", "utilize", "employ", "apply"],
+            },
+            'business': {
+                "MANAGES": ["manage", "lead", "supervise", "oversee"],
+                "WORKS_ON": ["work on", "develop", "create", "build"],
+                "REPORTS_TO": ["report", "report to", "under"],
+                "ASSIGNED_TO": ["assign", "responsible", "task", "delegate"],
+                "PARTICIPATES_IN": ["attend", "participate", "join", "meeting"],
+                "APPROVES": ["approve", "authorize", "sign off", "endorse"],
+            },
+            'legal': {
+                "BOUND_BY": ["bound", "obligated", "subject to", "governed"],
+                "ENTITLED_TO": ["entitled", "right to", "privilege", "authorized"],
+                "REFERS_TO": ["refer", "reference", "cite", "mention"],
+                "MODIFIES": ["modify", "amend", "change", "alter"],
+                "SUPERSEDES": ["supersede", "replace", "override", "cancel"],
+                "EFFECTIVE_FROM": ["effective", "commence", "begin", "start"],
+            },
+            'academic': {
+                "CITES": ["cite", "reference", "mention", "quote"],
+                "STUDIES": ["study", "research", "investigate", "examine"],
+                "PROPOSES": ["propose", "suggest", "recommend", "advocate"],
+                "DEMONSTRATES": ["demonstrate", "show", "prove", "establish"],
+                "BUILDS_ON": ["build", "extend", "develop", "advance"],
+                "CONTRADICTS": ["contradict", "dispute", "challenge", "refute"],
+            },
+            'medical': {
+                "DIAGNOSED_WITH": ["diagnose", "identified", "found", "detected"],
+                "TREATED_WITH": ["treat", "therapy", "medicine", "drug"],
+                "PRESCRIBED": ["prescribe", "recommend", "order", "administer"],
+                "EXHIBITS": ["exhibit", "show", "display", "present"],
+                "INDICATES": ["indicate", "suggest", "point to", "signal"],
+                "CAUSES": ["cause", "result in", "lead to", "trigger"],
+            },
+            'financial': {
+                "INVESTED_IN": ["invest", "fund", "finance", "back"],
+                "COSTS": ["cost", "expense", "price", "charge"],
+                "GENERATES": ["generate", "produce", "create", "earn"],
+                "ALLOCATED_TO": ["allocate", "assign", "budget", "designate"],
+                "TRANSFERS_TO": ["transfer", "move", "send", "pay"],
+                "YIELDS": ["yield", "return", "profit", "gain"],
+            }
+        }
+        
+        # Get patterns for the current domain, fallback to business patterns
+        patterns = domain_patterns.get(domain, domain_patterns['business'])
+        
+        # Check each pattern
+        for rel_type, keywords in patterns.items():
+            if any(keyword in context for keyword in keywords):
+                return rel_type
+        
+        # Generic fallback based on entity types and context
+        return self._generic_relationship_inference(context, entity1, entity2)
+
+    def _generic_relationship_inference(self, context: str, entity1: Entity, entity2: Entity) -> str:
+        """Generic relationship inference for unknown domains."""
+        # Simple pattern matching for common relationships
+        if any(word in context for word in ["with", "and", "together"]):
+            return "ASSOCIATED_WITH"
+        elif any(word in context for word in ["in", "at", "during"]):
+            return "OCCURRED_IN"
+        elif any(word in context for word in ["by", "from", "of"]):
+            return "RELATED_TO"
+        else:
+            return "MENTIONED_WITH"
     
     def _create_extraction_prompt(self, document: Document, existing_entity_types: Optional[List[str]] = None, existing_relationship_types: Optional[List[str]] = None) -> str:
         """Create a structured prompt for entity extraction with dynamic types from existing database."""
@@ -168,14 +626,21 @@ TYPE GUIDANCE:
 {entity_type_guidance}
 {relationship_type_guidance}
 
-INSTRUCTIONS:
-1. Extract entities that are mentioned in the document
-2. Extract relationships between entities that are explicitly stated or can be inferred
-3. Use confidence scores from 0.0 to 1.0 based on how certain you are
-4. Include aliases for entities when applicable
-5. Add relevant properties for context
-6. Choose entity and relationship types that best represent what's in the document
-7. Prefer existing types when they match the content, but create new types when needed
+CRITICAL INSTRUCTIONS:
+1. Extract ALL entities mentioned in the document
+2. For EVERY VERB and ACTION WORD in the text, create a relationship 
+3. Use the ACTUAL VERBS from the document as relationship types (CREATES, MANAGES, DEVELOPS, ASSIGNS, SCHEDULES, etc.)
+4. Convert verbs to relationship format: "creates" → "CREATES", "is responsible for" → "RESPONSIBLE_FOR"
+5. Extract explicit relationships AND infer from sentence structure
+6. Look for Subject-VERB-Object patterns throughout the text
+7. Use confidence scores from 0.0 to 1.0 based on directness
+8. Include aliases for entities when applicable
+9. Add relevant properties for context including timeframes, amounts, and specifics
+10. Choose entity and relationship types that best represent what's in the document
+11. Prefer existing types when they match the content, but create new types when needed
+12. For each entity, aim to extract 5-10+ relationships minimum
+13. Pay special attention to action words, verbs, and sentence structures
+14. Extract relationships from: assignments, responsibilities, actions, decisions, communications, schedules, locations, properties
 
 RESPONSE FORMAT (JSON only):
 {{
@@ -483,8 +948,8 @@ Only respond with valid JSON. Do not include any other text.
         
         return results
 
-    def _chunk_document(self, document: Document, chunk_size: int = 2000, overlap: int = 200) -> List[str]:
-        """Chunk a document into smaller segments for processing."""
+    def _chunk_document(self, document: Document, chunk_size: int = 3000, overlap: int = 400) -> List[str]:
+        """Chunk a document into smaller segments for processing with better relationship preservation."""
         content = document.content
         
         # If document is small enough, return as single chunk
@@ -500,11 +965,11 @@ Only respond with valid JSON. Do not include any other text.
             
             # If this isn't the last chunk, try to break at a sentence boundary
             if end < len(content):
-                # Look for sentence endings within the last 200 characters
-                sentence_ends = ['.', '!', '?', '\n\n']
+                # Look for sentence endings within the last 400 characters to preserve more context
+                sentence_ends = ['.', '!', '?', '\n\n', '\n#', '\n##', '\n###']  # Added markdown headers
                 best_break = -1
                 
-                for i in range(max(start + chunk_size - 200, start), min(end, len(content))):
+                for i in range(max(start + chunk_size - 400, start), min(end, len(content))):
                     if content[i] in sentence_ends and i > start:
                         best_break = i + 1
                 
@@ -515,88 +980,12 @@ Only respond with valid JSON. Do not include any other text.
             if chunk:
                 chunks.append(chunk)
             
-            # Move start forward, accounting for overlap
+            # Move start forward, accounting for larger overlap to preserve relationships
             start = max(end - overlap, start + 1)
             if start >= len(content):
                 break
         
         return chunks
-
-    def _create_spo_extraction_prompt(self, chunk: str, existing_entity_types: Optional[List[str]] = None, 
-                                    existing_relationship_types: Optional[List[str]] = None, 
-                                    document_title: str = "") -> str:
-        """Create a SUBJECT-PREDICATE-OBJECT focused extraction prompt."""
-        
-        # Build type guidance based on what's actually in the database
-        entity_type_guidance = ""
-        if existing_entity_types and len(existing_entity_types) > 0:
-            entity_type_guidance = f"\nExisting entity types: {', '.join(sorted(existing_entity_types))}"
-            entity_type_guidance += "\nReuse these types when appropriate, or create new ones."
-        else:
-            entity_type_guidance = "\nCreate appropriate entity types based on the content."
-        
-        relationship_type_guidance = ""
-        if existing_relationship_types and len(existing_relationship_types) > 0:
-            relationship_type_guidance = f"\nExisting relationship types: {', '.join(sorted(existing_relationship_types))}"
-            relationship_type_guidance += "\nReuse these types when appropriate, or create new ones."
-        else:
-            relationship_type_guidance = "\nCreate appropriate relationship types based on the content."
-        
-        prompt = f"""
-You are an expert knowledge graph builder. Extract SUBJECT-PREDICATE-OBJECT triples from this document chunk.
-
-DOCUMENT: {document_title}
-CONTENT CHUNK:
-{chunk}
-
-TYPE GUIDANCE:
-{entity_type_guidance}
-{relationship_type_guidance}
-
-INSTRUCTIONS:
-1. Identify entities (SUBJECTS and OBJECTS) - people, organizations, concepts, dates, locations, etc.
-2. Identify relationships (PREDICATES) between entities - actions, associations, properties, etc.
-3. Extract explicit relationships stated in the text
-4. Infer reasonable relationships from context
-5. Use ALL CAPS for relationship types (e.g., WORKS_FOR, FOUNDED_BY, LOCATED_IN)
-6. Be granular - create specific relationship types rather than generic ones
-7. Include confidence scores (0.0-1.0) based on certainty
-8. Add properties for additional context
-
-RELATIONSHIP TYPE EXAMPLES:
-- WORKS_FOR, EMPLOYED_BY, MANAGES, REPORTS_TO
-- FOUNDED, ESTABLISHED, CREATED, DEVELOPED  
-- LOCATED_IN, BASED_IN, OPERATES_IN, HEADQUARTERED_IN
-- PARTNERED_WITH, COLLABORATED_WITH, ACQUIRED, MERGED_WITH
-- ATTENDED, GRADUATED_FROM, STUDIED_AT, TAUGHT_AT
-- MENTIONED_IN, DISCUSSED_IN, REFERENCED_BY, DESCRIBED_IN
-- SCHEDULED_FOR, OCCURRED_ON, PLANNED_FOR, COMPLETED_ON
-
-RESPONSE FORMAT (JSON only):
-{{
-  "entities": [
-    {{
-      "name": "Entity Name",
-      "type": "ENTITY_TYPE",
-      "aliases": ["alias1", "alias2"],
-      "properties": {{"description": "brief description", "category": "subcategory"}},
-      "confidence": 0.9
-    }}
-  ],
-  "relationships": [
-    {{
-      "source_entity": "Subject Entity",
-      "target_entity": "Object Entity", 
-      "type": "PREDICATE_TYPE",
-      "properties": {{"context": "additional context", "timeframe": "when applicable"}},
-      "confidence": 0.8
-    }}
-  ]
-}}
-
-Only respond with valid JSON. Focus on creating granular, specific relationships.
-"""
-        return prompt
 
     def _deduplicate_entities(self, entities: List[Entity]) -> List[Entity]:
         """Remove duplicate entities based on name and type."""
