@@ -86,12 +86,30 @@ class Neo4jManager:
         """Create a document node in Neo4j."""
         try:
             async with self.driver.session() as session:
-                # Handle metadata properly - Neo4j doesn't like empty maps
+                # Handle metadata properly - flatten and convert to primitive types only
                 metadata_str = ""
                 metadata_params = {}
                 if metadata and len(metadata) > 0:
-                    metadata_str = ", d.metadata = $metadata"
-                    metadata_params["metadata"] = metadata
+                    # Filter and flatten metadata to only primitive types
+                    flattened_metadata = {}
+                    for key, value in metadata.items():
+                        if isinstance(value, (str, int, float, bool)):
+                            # Clean the key name for Neo4j compatibility
+                            clean_key = key.replace(' ', '_').replace('-', '_')
+                            flattened_metadata[clean_key] = value
+                        elif isinstance(value, list) and all(isinstance(v, (str, int, float, bool)) for v in value):
+                            clean_key = key.replace(' ', '_').replace('-', '_')
+                            flattened_metadata[clean_key] = value
+                    
+                    if flattened_metadata:
+                        prop_setters = []
+                        for prop_key, prop_value in flattened_metadata.items():
+                            param_name = f"meta_{prop_key}"
+                            prop_setters.append(f"d.{prop_key} = ${param_name}")
+                            metadata_params[param_name] = prop_value
+                        
+                        if prop_setters:
+                            metadata_str = ", " + ", ".join(prop_setters)
                 
                 query = f"""
                 MERGE (d:Document {{id: $document_id}})
@@ -218,11 +236,14 @@ class Neo4jManager:
                     if prop_setters:
                         properties_str = ", " + ", ".join(prop_setters)
                 
-                # Create relationship without requiring document to exist
+                # Create relationship with the actual relationship type
+                # Clean the relationship type to be a valid Cypher identifier
+                clean_rel_type = relationship_type.replace(" ", "_").replace("-", "_")
+                
                 query = f"""
                 MATCH (source:Entity {{id: $source_entity_id}})
                 MATCH (target:Entity {{id: $target_entity_id}})
-                MERGE (source)-[r:RELATES_TO {{type: $relationship_type}}]->(target)
+                MERGE (source)-[r:{clean_rel_type}]->(target)
                 SET r.confidence = $confidence,
                     r.document_id = $document_id,
                     r.created_at = datetime()
@@ -233,7 +254,6 @@ class Neo4jManager:
                 params = {
                     "source_entity_id": source_entity_id,
                     "target_entity_id": target_entity_id,
-                    "relationship_type": relationship_type,
                     "document_id": document_id,
                     "confidence": confidence
                 }
@@ -320,8 +340,8 @@ class Neo4jManager:
                 async for record in entity_result:
                     entity_count = record["count"]
                 
-                # Count relationships
-                rel_result = await session.run("MATCH ()-[r:RELATES_TO]->() RETURN count(r) as count")
+                # Count all relationships (not just RELATES_TO)
+                rel_result = await session.run("MATCH ()-[r]->() RETURN count(r) as count")
                 rel_count = 0
                 async for record in rel_result:
                     rel_count = record["count"]
@@ -505,7 +525,7 @@ class Neo4jManager:
                        OR toLower($name) CONTAINS toLower(e.name)
                     RETURN e.id as id, e.name as name, e.type as type,
                            e.confidence as confidence, e.properties as properties
-                    ORDER BY length(e.name)
+                    ORDER BY size(e.name)
                     LIMIT 10
                 """
                 
