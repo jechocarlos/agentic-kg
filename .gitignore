@@ -261,3 +261,5 @@ checkpoints/
 .env.production
 api_keys.txt
 credentials.json
+
+documents/*

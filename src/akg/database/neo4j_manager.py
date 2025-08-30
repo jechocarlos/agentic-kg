@@ -124,25 +124,34 @@ class Neo4jManager:
     async def create_entity(self, entity_id: str, name: str, entity_type: str,
                           document_id: str, properties: Optional[Dict[str, Any]] = None,
                           confidence: float = 0.0) -> bool:
-        """Create an entity node and link it to a document."""
+        """Create an entity node and optionally link it to a document."""
         try:
             async with self.driver.session() as session:
-                # Handle properties properly - Neo4j doesn't like empty maps
+                # Handle properties properly - set each property individually
                 properties_str = ""
                 properties_params = {}
                 if properties and len(properties) > 0:
-                    properties_str = ", e.properties = $properties"
-                    properties_params["properties"] = properties
+                    # Create individual property setters
+                    prop_setters = []
+                    for key, value in properties.items():
+                        # Ensure the key is safe for Cypher
+                        safe_key = key.replace(" ", "_").replace("-", "_")
+                        param_name = f"prop_{safe_key}"
+                        prop_setters.append(f"e.{safe_key} = ${param_name}")
+                        properties_params[param_name] = value
+                    
+                    if prop_setters:
+                        properties_str = ", " + ", ".join(prop_setters)
                 
+                # Create entity first, then optionally link to document
                 query = f"""
-                MATCH (d:Document {{id: $document_id}})
                 MERGE (e:Entity {{id: $entity_id}})
                 SET e.name = $name,
                     e.type = $entity_type,
                     e.confidence = $confidence,
-                    e.created_at = datetime()
+                    e.created_at = datetime(),
+                    e.document_id = $document_id
                     {properties_str}
-                MERGE (e)-[:MENTIONED_IN]->(d)
                 RETURN e
                 """
                 
@@ -158,8 +167,29 @@ class Neo4jManager:
                 result = await session.run(query, params)
                 
                 # Consume the result to ensure the query is executed
-                await result.consume()
-                return True
+                record = await result.single()
+                if record:
+                    logger.debug(f"Created entity: {record['e']}")
+                    
+                    # Now try to link to document if it exists
+                    link_query = """
+                    MATCH (e:Entity {id: $entity_id})
+                    MATCH (d:Document {id: $document_id})
+                    MERGE (e)-[:MENTIONED_IN]->(d)
+                    """
+                    try:
+                        await session.run(link_query, {
+                            "entity_id": entity_id,
+                            "document_id": document_id
+                        })
+                        logger.debug(f"Linked entity {entity_id} to document {document_id}")
+                    except Exception as link_error:
+                        logger.warning(f"Could not link entity to document: {link_error}")
+                    
+                    return True
+                else:
+                    logger.error("No entity record returned")
+                    return False
                 
         except Exception as e:
             logger.error(f"Error creating entity: {e}")
@@ -172,17 +202,26 @@ class Neo4jManager:
         """Create a relationship between two entities."""
         try:
             async with self.driver.session() as session:
-                # Handle properties properly - Neo4j doesn't like empty maps
+                # Handle properties properly - set each property individually
                 properties_str = ""
                 properties_params = {}
                 if properties and len(properties) > 0:
-                    properties_str = ", r.properties = $properties"
-                    properties_params["properties"] = properties
+                    # Create individual property setters
+                    prop_setters = []
+                    for key, value in properties.items():
+                        # Ensure the key is safe for Cypher
+                        safe_key = key.replace(" ", "_").replace("-", "_")
+                        param_name = f"rel_prop_{safe_key}"
+                        prop_setters.append(f"r.{safe_key} = ${param_name}")
+                        properties_params[param_name] = value
+                    
+                    if prop_setters:
+                        properties_str = ", " + ", ".join(prop_setters)
                 
+                # Create relationship without requiring document to exist
                 query = f"""
                 MATCH (source:Entity {{id: $source_entity_id}})
                 MATCH (target:Entity {{id: $target_entity_id}})
-                MATCH (d:Document {{id: $document_id}})
                 MERGE (source)-[r:RELATES_TO {{type: $relationship_type}}]->(target)
                 SET r.confidence = $confidence,
                     r.document_id = $document_id,
@@ -376,3 +415,114 @@ class Neo4jManager:
         except Exception as e:
             logger.error(f"Error deleting document graph: {e}")
             return False
+
+    async def get_existing_entity_types(self) -> List[str]:
+        """Get all unique entity types currently in the database."""
+        try:
+            async with self.driver.session() as session:
+                result = await session.run("""
+                    MATCH (e:Entity)
+                    RETURN DISTINCT e.type as type
+                    ORDER BY type
+                """)
+                
+                types = []
+                async for record in result:
+                    if record["type"]:
+                        types.append(record["type"])
+                
+                return types
+                
+        except Exception as e:
+            logger.error(f"Error getting entity types: {e}")
+            return []
+
+    async def get_existing_relationship_types(self) -> List[str]:
+        """Get all unique relationship types currently in the database."""
+        try:
+            async with self.driver.session() as session:
+                result = await session.run("""
+                    MATCH ()-[r:RELATES_TO]->()
+                    RETURN DISTINCT r.type as type
+                    ORDER BY type
+                """)
+                
+                types = []
+                async for record in result:
+                    if record["type"]:
+                        types.append(record["type"])
+                
+                return types
+                
+        except Exception as e:
+            logger.error(f"Error getting relationship types: {e}")
+            return []
+
+    async def get_entity_by_name_and_type(self, name: str, entity_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Find an entity by name and optionally type."""
+        try:
+            async with self.driver.session() as session:
+                if entity_type:
+                    query = """
+                        MATCH (e:Entity {name: $name, type: $entity_type})
+                        RETURN e.id as id, e.name as name, e.type as type,
+                               e.confidence as confidence, e.properties as properties
+                        LIMIT 1
+                    """
+                    result = await session.run(query, {"name": name, "entity_type": entity_type})
+                else:
+                    query = """
+                        MATCH (e:Entity {name: $name})
+                        RETURN e.id as id, e.name as name, e.type as type,
+                               e.confidence as confidence, e.properties as properties
+                        LIMIT 1
+                    """
+                    result = await session.run(query, {"name": name})
+                
+                async for record in result:
+                    return {
+                        "id": record["id"],
+                        "name": record["name"],
+                        "type": record["type"],
+                        "confidence": record["confidence"],
+                        "properties": record["properties"]
+                    }
+                
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error finding entity by name: {e}")
+            return None
+
+    async def find_similar_entities(self, name: str, threshold: float = 0.8) -> List[Dict[str, Any]]:
+        """Find entities with similar names using fuzzy matching."""
+        try:
+            async with self.driver.session() as session:
+                # Simple approach: find entities that contain the search term or vice versa
+                query = """
+                    MATCH (e:Entity)
+                    WHERE toLower(e.name) CONTAINS toLower($name)
+                       OR toLower($name) CONTAINS toLower(e.name)
+                    RETURN e.id as id, e.name as name, e.type as type,
+                           e.confidence as confidence, e.properties as properties
+                    ORDER BY length(e.name)
+                    LIMIT 10
+                """
+                
+                result = await session.run(query, {"name": name})
+                entities = []
+                
+                async for record in result:
+                    entities.append({
+                        "id": record["id"],
+                        "name": record["name"],
+                        "type": record["type"],
+                        "confidence": record["confidence"],
+                        "properties": record["properties"]
+                    })
+                
+                return entities
+                
+        except Exception as e:
+            logger.error(f"Error finding similar entities: {e}")
+            return []

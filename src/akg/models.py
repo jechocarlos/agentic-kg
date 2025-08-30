@@ -29,7 +29,7 @@ class Entity(BaseModel):
     """Represents an entity extracted from documents."""
     id: str
     name: str
-    entity_type: EntityType
+    entity_type: str  # Changed from EntityType to str for flexibility
     document_id: Optional[str] = None
     properties: Dict[str, Any] = Field(default_factory=dict)
     aliases: List[str] = Field(default_factory=list)
@@ -42,7 +42,7 @@ class Relationship(BaseModel):
     id: str
     source_entity_id: str
     target_entity_id: str
-    relationship_type: RelationType
+    relationship_type: str  # Changed from RelationType to str for flexibility
     document_id: Optional[str] = None
     properties: Dict[str, Any] = Field(default_factory=dict)
     confidence_score: float = Field(default=0.0, ge=0.0, le=1.0)
