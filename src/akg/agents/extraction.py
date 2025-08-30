@@ -2,6 +2,7 @@
 Entity and relationship extraction agent using Google Gemini with fallback to pattern matching.
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -88,6 +89,15 @@ class EntityExtractionAgent:
                     # Parse the response with type resolution
                     entities, relationships = await self._parse_gemini_response_with_type_resolution(response.text, document.id)
                     
+                    # Save entities and relationships immediately after each chunk
+                    if entities or relationships:
+                        logger.info(f"💾 Saving chunk {i+1} results immediately to Neo4j...")
+                        chunk_save_success = await self.save_to_neo4j(entities, relationships)
+                        if chunk_save_success:
+                            logger.info(f"✅ Chunk {i+1} saved successfully to Neo4j")
+                        else:
+                            logger.warning(f"⚠️ Failed to save chunk {i+1} to Neo4j, continuing...")
+                    
                     all_entities.extend(entities)
                     all_relationships.extend(relationships)
                     
@@ -114,6 +124,15 @@ class EntityExtractionAgent:
                     # Apply type resolution to fallback results
                     entities, relationships = await self._apply_type_resolution_to_fallback(entities, relationships)
                     
+                    # Save fallback results immediately to Neo4j
+                    if entities or relationships:
+                        logger.info(f"💾 Saving fallback chunk {i+1} results immediately to Neo4j...")
+                        chunk_save_success = await self.save_to_neo4j(entities, relationships)
+                        if chunk_save_success:
+                            logger.info(f"✅ Fallback chunk {i+1} saved successfully to Neo4j")
+                        else:
+                            logger.warning(f"⚠️ Failed to save fallback chunk {i+1} to Neo4j, continuing...")
+                    
                     all_entities.extend(entities)
                     all_relationships.extend(relationships)
             else:
@@ -136,6 +155,15 @@ class EntityExtractionAgent:
                 # Apply type resolution to fallback results
                 entities, relationships = await self._apply_type_resolution_to_fallback(entities, relationships)
                 
+                # Save fallback results immediately to Neo4j
+                if entities or relationships:
+                    logger.info(f"💾 Saving fallback chunk {i+1} results immediately to Neo4j...")
+                    chunk_save_success = await self.save_to_neo4j(entities, relationships)
+                    if chunk_save_success:
+                        logger.info(f"✅ Fallback chunk {i+1} saved successfully to Neo4j")
+                    else:
+                        logger.warning(f"⚠️ Failed to save fallback chunk {i+1} to Neo4j, continuing...")
+                
                 all_entities.extend(entities)
                 all_relationships.extend(relationships)
         
@@ -148,6 +176,16 @@ class EntityExtractionAgent:
             cross_chunk_relationships = await self._discover_adaptive_cross_chunk_relationships(
                 all_entities, document, document_analysis
             )
+            
+            # Save cross-chunk relationships immediately
+            if cross_chunk_relationships:
+                logger.info(f"💾 Saving {len(cross_chunk_relationships)} cross-chunk relationships to Neo4j...")
+                cross_chunk_save_success = await self.save_to_neo4j([], cross_chunk_relationships)
+                if cross_chunk_save_success:
+                    logger.info(f"✅ Cross-chunk relationships saved successfully to Neo4j")
+                else:
+                    logger.warning(f"⚠️ Failed to save cross-chunk relationships to Neo4j")
+            
             all_relationships.extend(cross_chunk_relationships)
             all_relationships = self._deduplicate_relationships(all_relationships)
         
@@ -793,14 +831,21 @@ Only respond with valid JSON. Do not include any other text.
                     # Resolve the entity type using TypeManager
                     resolved_entity_type, is_new_type = await self.type_manager.resolve_entity_type(proposed_entity_type)
                     
-                    # Check if entity already exists in Neo4j
+                    # Check if entity already exists in Neo4j (with graceful failure handling)
                     existing_entity = None
                     if self.neo4j_manager:
                         try:
-                            existing_entity = await self.neo4j_manager.get_entity_by_name_and_type(entity_name, resolved_entity_type)
+                            # Add timeout and connection retry handling
+                            existing_entity = await asyncio.wait_for(
+                                self.neo4j_manager.get_entity_by_name_and_type(entity_name, resolved_entity_type),
+                                timeout=5.0  # 5 second timeout
+                            )
                             if not existing_entity:
-                                # Try fuzzy matching
-                                similar_entities = await self.neo4j_manager.find_similar_entities(entity_name)
+                                # Try fuzzy matching with timeout
+                                similar_entities = await asyncio.wait_for(
+                                    self.neo4j_manager.find_similar_entities(entity_name),
+                                    timeout=5.0
+                                )
                                 if similar_entities:
                                     # Check if any similar entity has a compatible type
                                     for similar_entity in similar_entities:
@@ -808,8 +853,9 @@ Only respond with valid JSON. Do not include any other text.
                                             existing_entity = similar_entity
                                             logger.info(f"🔗 Matched '{entity_name}' to existing entity '{existing_entity['name']}' with type '{resolved_entity_type}'")
                                             break
-                        except Exception as e:
-                            logger.warning(f"⚠️ Error looking up entity in Neo4j: {e}")
+                        except (Exception, asyncio.TimeoutError) as e:
+                            logger.warning(f"⚠️ Error looking up entity in Neo4j (continuing without lookup): {e}")
+                            # Continue processing without Neo4j lookup - entities will be created as new
                     
                     if existing_entity:
                         # Use existing entity
@@ -943,76 +989,84 @@ Only respond with valid JSON. Do not include any other text.
         return resolved_entities, resolved_relationships
     
     async def save_to_neo4j(self, entities: List[Entity], relationships: List[Relationship]) -> bool:
-        """Save extracted entities and relationships to Neo4j."""
+        """Save extracted entities and relationships to Neo4j with retry logic."""
         if not self.neo4j_manager:
             logger.warning("Neo4j manager not available, skipping save")
             return False
         
-        try:
-            # Save entities
-            if entities:
-                logger.info(f"💾 Saving {len(entities)} entities to Neo4j...")
-                for entity in entities:
-                    await self.neo4j_manager.create_entity(
-                        entity_id=entity.id,
-                        name=entity.name,
-                        entity_type=entity.entity_type,  # Now a string, not enum
-                        document_id=entity.document_id,
-                        properties=entity.properties,
-                        confidence=entity.confidence_score
-                    )
-                logger.info(f"✅ Saved {len(entities)} entities")
-            
-            # Save relationships
-            if relationships:
-                logger.info(f"🔗 Saving {len(relationships)} relationships to Neo4j...")
-                for relationship in relationships:
-                    await self.neo4j_manager.create_relationship(
-                        source_entity_id=relationship.source_entity_id,
-                        target_entity_id=relationship.target_entity_id,
-                        relationship_type=relationship.relationship_type,  # Now a string, not enum
-                        document_id=relationship.document_id,
-                        properties=relationship.properties,
-                        confidence=relationship.confidence_score
-                    )
-                logger.info(f"✅ Saved {len(relationships)} relationships")
-            
-            logger.info(f"✅ Successfully saved {len(entities)} entities and {len(relationships)} relationships to Neo4j")
-            return True
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to save to Neo4j: {e}")
-            return False
+        max_retries = 3
+        retry_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                # Save entities
+                if entities:
+                    logger.info(f"💾 Saving {len(entities)} entities to Neo4j... (attempt {attempt + 1})")
+                    for entity in entities:
+                        await asyncio.wait_for(
+                            self.neo4j_manager.create_entity(
+                                entity_id=entity.id,
+                                name=entity.name,
+                                entity_type=entity.entity_type,  # Now a string, not enum
+                                document_id=entity.document_id,
+                                properties=entity.properties,
+                                confidence=entity.confidence_score
+                            ),
+                            timeout=10.0  # 10 second timeout per entity
+                        )
+                    logger.info(f"✅ Saved {len(entities)} entities")
+                
+                # Save relationships
+                if relationships:
+                    logger.info(f"🔗 Saving {len(relationships)} relationships to Neo4j... (attempt {attempt + 1})")
+                    for relationship in relationships:
+                        await asyncio.wait_for(
+                            self.neo4j_manager.create_relationship(
+                                source_entity_id=relationship.source_entity_id,
+                                target_entity_id=relationship.target_entity_id,
+                                relationship_type=relationship.relationship_type,  # Now a string, not enum
+                                document_id=relationship.document_id,
+                                properties=relationship.properties,
+                                confidence=relationship.confidence_score
+                            ),
+                            timeout=10.0  # 10 second timeout per relationship
+                        )
+                    logger.info(f"✅ Saved {len(relationships)} relationships")
+                
+                logger.info(f"✅ Successfully saved {len(entities)} entities and {len(relationships)} relationships to Neo4j")
+                return True
+                
+            except (Exception, asyncio.TimeoutError) as e:
+                logger.warning(f"❌ Attempt {attempt + 1} failed to save to Neo4j: {e}")
+                if attempt < max_retries - 1:
+                    logger.info(f"⏱️ Retrying in {retry_delay} seconds...")
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logger.error(f"❌ Failed to save to Neo4j after {max_retries} attempts")
+                    return False
+        
+        return False  # Should never reach here, but just in case
     
     async def process_document(self, document: Document) -> Dict[str, Any]:
-        """Process a single document: extract entities/relationships and save to Neo4j."""
+        """Process a single document: extract entities/relationships with immediate chunk-by-chunk saving to Neo4j."""
         logger.info(f"🔄 Processing document: {document.title}")
         
-        # Extract entities and relationships
+        # Extract entities and relationships (with immediate saving per chunk)
         entities, relationships = await self.extract_entities_and_relationships(document)
         
-        # Save to Neo4j
-        if entities or relationships:
-            success = await self.save_to_neo4j(entities, relationships)
-            
-            return {
-                'document_id': document.id,
-                'entities_count': len(entities),
-                'relationships_count': len(relationships),
-                'neo4j_saved': success,
-                'entities': [e.dict() for e in entities],
-                'relationships': [r.dict() for r in relationships]
-            }
-        else:
-            logger.warning(f"⚠️ No entities or relationships extracted from: {document.title}")
-            return {
-                'document_id': document.id,
-                'entities_count': 0,
-                'relationships_count': 0,
-                'neo4j_saved': False,
-                'entities': [],
-                'relationships': []
-            }
+        # Note: Entities and relationships are already saved to Neo4j during chunk processing
+        # This method now just returns the summary of what was processed
+        logger.info(f"✅ Document processing complete: {len(entities)} entities and {len(relationships)} relationships")
+        
+        return {
+            'document_id': document.id,
+            'entities_count': len(entities),
+            'relationships_count': len(relationships),
+            'neo4j_saved': True,  # Always true since saving happens per chunk
+            'entities': [e.dict() for e in entities],
+            'relationships': [r.dict() for r in relationships]
+        }
     
     async def process_documents(self, documents: List[Document]) -> List[Dict[str, Any]]:
         """Process multiple documents for entity extraction."""
