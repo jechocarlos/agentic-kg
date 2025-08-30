@@ -18,6 +18,7 @@ from rich.table import Table
 # Add the src directory to the path so we can import our modules
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from akg.agents.extraction import EntityExtractionAgent
 from akg.agents.ingestion import LocalFileIngestionAgent
 from akg.config import config
 from akg.database.neo4j_manager import Neo4jManager
@@ -52,6 +53,9 @@ class AKGApplication:
         )
         self.ingestion_agent = LocalFileIngestionAgent(
             supabase_manager=self.supabase_manager,
+            neo4j_manager=self.neo4j_manager
+        )
+        self.extraction_agent = EntityExtractionAgent(
             neo4j_manager=self.neo4j_manager
         )
         self.console = console
@@ -93,15 +97,40 @@ class AKGApplication:
             
         return documents
         
+    async def extract_entities(self, documents: List[Document]) -> List[Dict]:
+        """Extract entities and relationships from processed documents."""
+        if not documents:
+            logger.info("No documents to extract entities from")
+            return []
+            
+        logger.info(f"🧠 Starting entity extraction for {len(documents)} documents...")
+        
+        try:
+            extraction_results = await self.extraction_agent.process_documents(documents)
+            return extraction_results
+        except Exception as e:
+            logger.error(f"❌ Entity extraction failed: {e}")
+            return []
+        
     async def run_batch_processing(self):
         """Run one-time batch processing of all documents."""
         await self.initialize()
         
+        # Step 1: Process documents
         documents = await self.process_documents()
+        
+        # Step 2: Extract entities and relationships
+        extraction_results = await self.extract_entities(documents)
         
         # Display results
         self.console.print(f"\n📊 Processing Results:")
         self.console.print(f"  - Documents processed: {len(documents)}")
+        
+        if extraction_results:
+            total_entities = sum(r['entities_count'] for r in extraction_results)
+            total_relationships = sum(r['relationships_count'] for r in extraction_results)
+            self.console.print(f"  - Entities extracted: {total_entities}")
+            self.console.print(f"  - Relationships extracted: {total_relationships}")
         
         # Get database statistics
         try:
