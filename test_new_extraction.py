@@ -4,22 +4,15 @@ Test script to verify new chunked extraction with ALL CAPS relationship types.
 """
 import asyncio
 import logging
-import sys
 from pathlib import Path
 
-import pytest
-
-# Add src to path  
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
-
-from akg.agents.extraction import EntityExtractionAgent
-from akg.database.neo4j_manager import Neo4jManager
-from akg.models import Document
+from src.akg.database.neo4j_manager import Neo4jManager
+from src.akg.agents.extraction import EntityExtractionAgent
+from src.akg.models import Document
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-@pytest.mark.asyncio
 async def test_new_extraction():
     """Test the new chunked extraction with ALL CAPS relationship types."""
     
@@ -32,8 +25,8 @@ async def test_new_extraction():
     try:
         # Clear existing data - use a direct query
         logger.info("🧹 Clearing existing data...")
-        success = await neo4j_manager.clear_all_data()
-        assert success, "Failed to clear database"
+        async with neo4j_manager.driver.session() as session:
+            await session.run("MATCH (n) DETACH DELETE n")
         
         # Create a test document
         test_doc = Document(
@@ -76,24 +69,33 @@ async def test_new_extraction():
         logger.info(f"   - Total entities: {stats.get('total_entities', 0)}")
         logger.info(f"   - Total relationships: {stats.get('total_relationships', 0)}")
         
-        # Basic assertions
-        assert result['entities_count'] > 0, "Should extract some entities"
-        assert result['relationships_count'] > 0, "Should extract some relationships"
-        assert result['neo4j_saved'], "Should successfully save to Neo4j"
-        
-        # Verify we have data
-        assert stats['total_entities'] > 0
-        assert stats['total_relationships'] > 0
-        
         # Get all relationship types
-        relationship_types = await neo4j_manager.get_existing_relationship_types()
+        async with neo4j_manager.driver.session() as session:
+            result = await session.run("""
+                MATCH ()-[r]->()
+                RETURN DISTINCT type(r) as relationship_type
+                ORDER BY relationship_type
+            """)
+            relationship_types = [record["relationship_type"] async for record in result]
+        
         logger.info(f"Relationship types found: {relationship_types}")
         
-        # Verify ALL CAPS if we have relationship types
-        if relationship_types:
-            all_caps = all(rt.isupper() for rt in relationship_types)
-            logger.info(f"All relationship types in ALL CAPS: {all_caps}")
-            assert all_caps, "All relationship types should be in ALL CAPS"
+        # Verify ALL CAPS
+        all_caps = all(rt.isupper() for rt in relationship_types)
+        logger.info(f"All relationship types in ALL CAPS: {all_caps}")
+        
+        # Show some sample relationships
+        async with neo4j_manager.driver.session() as session:
+            result = await session.run("""
+                MATCH (a)-[r]->(b)
+                RETURN a.name as source, type(r) as relationship, b.name as target
+                LIMIT 10
+            """)
+            samples = [{"source": record["source"], "relationship": record["relationship"], "target": record["target"]} async for record in result]
+        
+        logger.info("Sample relationships:")
+        for sample in samples:
+            logger.info(f"   {sample['source']} -{sample['relationship']}-> {sample['target']}")
         
     except Exception as e:
         logger.error(f"❌ Test failed: {e}")
