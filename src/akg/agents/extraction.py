@@ -17,6 +17,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from ..config import config
 from ..models import Document, Entity, Relationship
+from .coreference_resolver import CoreferenceResolver
 from .fallback_extraction import FallbackEntityExtractor
 from .type_manager import TypeManager
 
@@ -33,6 +34,7 @@ class EntityExtractionAgent:
         self.model = None
         self.fallback_extractor = FallbackEntityExtractor()
         self.type_manager = TypeManager(neo4j_manager=neo4j_manager)
+        self.coreference_resolver = CoreferenceResolver(neo4j_manager=neo4j_manager)
         self._initialize_gemini()
         
     def _initialize_gemini(self):
@@ -89,6 +91,12 @@ class EntityExtractionAgent:
                     # Parse the response with type resolution
                     entities, relationships = await self._parse_gemini_response_with_type_resolution(response.text, document.id)
                     
+                    # Apply coreference resolution to resolve pronouns and generic references
+                    if entities and config.enable_coreference_resolution:
+                        document_context = self._determine_document_context(document.title, document.document_type)
+                        logger.info(f"🔗 Applying coreference resolution for chunk {i+1} (context: {document_context})")
+                        entities = await self.coreference_resolver.resolve_coreferences_in_entities(entities, document_context)
+                    
                     # Save entities and relationships immediately after each chunk
                     if entities or relationships:
                         logger.info(f"💾 Saving chunk {i+1} results immediately to Neo4j...")
@@ -123,6 +131,12 @@ class EntityExtractionAgent:
                     
                     # Apply type resolution to fallback results
                     entities, relationships = await self._apply_type_resolution_to_fallback(entities, relationships)
+                    
+                    # Apply coreference resolution to fallback results
+                    if entities and config.enable_coreference_resolution:
+                        document_context = self._determine_document_context(document.title, document.document_type)
+                        logger.info(f"🔗 Applying coreference resolution for fallback chunk {i+1} (context: {document_context})")
+                        entities = await self.coreference_resolver.resolve_coreferences_in_entities(entities, document_context)
                     
                     # Save fallback results immediately to Neo4j
                     if entities or relationships:
@@ -890,6 +904,22 @@ Only respond with valid JSON. Do not include any other text.
         except (Exception, asyncio.TimeoutError) as e:
             logger.warning(f"⚠️ Error during entity lookup for '{entity_name}': {e}. Creating new entity.")
             return str(uuid.uuid4()), True
+
+    def _determine_document_context(self, title: str, doc_type: str) -> str:
+        """Determine the document context for coreference resolution."""
+        title_lower = title.lower() if title else ""
+        doc_type_lower = doc_type.lower() if doc_type else ""
+        
+        if any(term in title_lower for term in ['privacy', 'policy', 'data protection']):
+            return 'privacy_policy'
+        elif any(term in title_lower for term in ['terms', 'service', 'agreement', 'tos']):
+            return 'terms_of_service'
+        elif any(term in title_lower for term in ['license', 'eula', 'end user']):
+            return 'license_agreement'
+        elif any(term in doc_type_lower for term in ['legal', 'contract', 'agreement']):
+            return 'legal_document'
+        else:
+            return 'general'
 
     async def _parse_gemini_response_with_type_resolution(self, response_text: str, document_id: str) -> Tuple[List[Entity], List[Relationship]]:
         """Parse Gemini response into Entity and Relationship objects with comprehensive deduplication."""
