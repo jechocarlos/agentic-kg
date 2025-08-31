@@ -802,8 +802,97 @@ Only respond with valid JSON. Do not include any other text.
 """
         return prompt
     
+    async def _find_or_create_entity(self, entity_name: str, entity_type: str, document_id: Optional[str], 
+                                   properties: Dict[str, Any], confidence: float = 0.7) -> Tuple[str, bool]:
+        """
+        Find existing similar entity or create new one.
+        Returns (entity_id, is_new_entity)
+        """
+        # Check if deduplication is enabled
+        if not config.enable_entity_deduplication or not self.neo4j_manager:
+            return str(uuid.uuid4()), True
+        
+        try:
+            # Step 1: Try exact match by name and type
+            logger.debug(f"🔍 Looking for existing entity: '{entity_name}' (type: {entity_type})")
+            existing_entity = await asyncio.wait_for(
+                self.neo4j_manager.get_entity_by_name_and_type(entity_name, entity_type),
+                timeout=5.0
+            )
+            
+            if existing_entity:
+                logger.info(f"📌 Found exact match for '{entity_name}': reusing entity {existing_entity['id']}")
+                return existing_entity['id'], False
+            
+            # Step 2: Try fuzzy matching with enhanced similarity search
+            similar_entities = await asyncio.wait_for(
+                self.neo4j_manager.find_similar_entities(
+                    entity_name, 
+                    entity_type, 
+                    threshold=config.entity_similarity_threshold
+                ),
+                timeout=5.0
+            )
+            
+            if similar_entities:
+                # Use the best match (highest similarity score)
+                best_match = similar_entities[0]
+                similarity_score = best_match.get('similarity_score', 0.0)
+                match_type = best_match.get('match_type', 'unknown')
+                
+                # Higher threshold for automatic reuse
+                if similarity_score >= 0.9:  # Very high confidence
+                    logger.info(f"🎯 High confidence match for '{entity_name}' -> '{best_match['name']}' "
+                              f"(score: {similarity_score:.2f}, type: {match_type}): reusing entity {best_match['id']}")
+                    return best_match['id'], False
+                    
+                elif similarity_score >= config.entity_similarity_threshold:  # Medium confidence - check type compatibility
+                    if best_match['type'] == entity_type:
+                        logger.info(f"🔗 Good match for '{entity_name}' -> '{best_match['name']}' "
+                                  f"(score: {similarity_score:.2f}, type: {match_type}): reusing entity {best_match['id']}")
+                        return best_match['id'], False
+                    else:
+                        logger.debug(f"🤔 Found similar entity '{best_match['name']}' but different type "
+                                   f"(expected: {entity_type}, found: {best_match['type']}): creating new entity")
+                
+                else:
+                    logger.debug(f"📋 Found potential matches for '{entity_name}' but low confidence "
+                               f"(best score: {similarity_score:.2f}): creating new entity")
+            
+            # Step 3: Try broader search without type constraint if no good matches
+            if not similar_entities or (similar_entities and similar_entities[0].get('similarity_score', 0.0) < config.entity_similarity_threshold):
+                logger.debug(f"🔍 Trying broader search for '{entity_name}' without type constraint")
+                similar_entities_any_type = await asyncio.wait_for(
+                    self.neo4j_manager.find_similar_entities(
+                        entity_name, 
+                        entity_type=None, 
+                        threshold=config.cross_type_similarity_threshold
+                    ),
+                    timeout=5.0
+                )
+                
+                if similar_entities_any_type:
+                    best_match = similar_entities_any_type[0]
+                    similarity_score = best_match.get('similarity_score', 0.0)
+                    
+                    # Only reuse if very high similarity, even with different type
+                    if similarity_score >= config.cross_type_similarity_threshold:
+                        logger.info(f"🔄 Cross-type match for '{entity_name}' -> '{best_match['name']}' "
+                                  f"(score: {similarity_score:.2f}, changing type from {best_match['type']} to {entity_type}): "
+                                  f"reusing entity {best_match['id']}")
+                        return best_match['id'], False
+            
+            # Step 4: No good matches found - create new entity
+            new_entity_id = str(uuid.uuid4())
+            logger.info(f"✨ Creating new entity: '{entity_name}' (type: {entity_type}) with ID {new_entity_id}")
+            return new_entity_id, True
+            
+        except (Exception, asyncio.TimeoutError) as e:
+            logger.warning(f"⚠️ Error during entity lookup for '{entity_name}': {e}. Creating new entity.")
+            return str(uuid.uuid4()), True
+
     async def _parse_gemini_response_with_type_resolution(self, response_text: str, document_id: str) -> Tuple[List[Entity], List[Relationship]]:
-        """Parse Gemini response into Entity and Relationship objects with type resolution."""
+        """Parse Gemini response into Entity and Relationship objects with comprehensive deduplication."""
         entities = []
         relationships = []
         
@@ -822,7 +911,7 @@ Only respond with valid JSON. Do not include any other text.
             # Create entity name to ID mapping (for new entities and existing ones)
             entity_name_to_id = {}
             
-            # Process entities with type resolution
+            # Process entities with comprehensive deduplication
             for entity_data in data.get('entities', []):
                 try:
                     entity_name = entity_data['name']
@@ -831,46 +920,24 @@ Only respond with valid JSON. Do not include any other text.
                     # Resolve the entity type using TypeManager
                     resolved_entity_type, is_new_type = await self.type_manager.resolve_entity_type(proposed_entity_type)
                     
-                    # Check if entity already exists in Neo4j (with graceful failure handling)
-                    existing_entity = None
-                    if self.neo4j_manager:
-                        try:
-                            # Add timeout and connection retry handling
-                            existing_entity = await asyncio.wait_for(
-                                self.neo4j_manager.get_entity_by_name_and_type(entity_name, resolved_entity_type),
-                                timeout=5.0  # 5 second timeout
-                            )
-                            if not existing_entity:
-                                # Try fuzzy matching with timeout
-                                similar_entities = await asyncio.wait_for(
-                                    self.neo4j_manager.find_similar_entities(entity_name),
-                                    timeout=5.0
-                                )
-                                if similar_entities:
-                                    # Check if any similar entity has a compatible type
-                                    for similar_entity in similar_entities:
-                                        if similar_entity['type'] == resolved_entity_type:
-                                            existing_entity = similar_entity
-                                            logger.info(f"🔗 Matched '{entity_name}' to existing entity '{existing_entity['name']}' with type '{resolved_entity_type}'")
-                                            break
-                        except (Exception, asyncio.TimeoutError) as e:
-                            logger.warning(f"⚠️ Error looking up entity in Neo4j (continuing without lookup): {e}")
-                            # Continue processing without Neo4j lookup - entities will be created as new
+                    # Use enhanced entity deduplication
+                    entity_id, is_new_entity = await self._find_or_create_entity(
+                        entity_name=entity_name,
+                        entity_type=resolved_entity_type,
+                        document_id=document_id,
+                        properties=entity_data.get('properties', {}),
+                        confidence=entity_data.get('confidence', 0.7)
+                    )
                     
-                    if existing_entity:
-                        # Use existing entity
-                        entity_id = existing_entity['id']
-                        entity_name_to_id[entity_name] = entity_id
-                        logger.info(f"📌 Reusing existing entity: {entity_name} ({entity_id}) with type '{resolved_entity_type}'")
-                    else:
-                        # Create new entity with resolved type
-                        entity_id = str(uuid.uuid4())
-                        entity_name_to_id[entity_name] = entity_id
-                        
+                    # Store the mapping for relationship processing
+                    entity_name_to_id[entity_name] = entity_id
+                    
+                    # Only create Entity object if it's a new entity
+                    if is_new_entity:
                         entity = Entity(
                             id=entity_id,
                             name=entity_name,
-                            entity_type=resolved_entity_type,  # Use resolved type
+                            entity_type=resolved_entity_type,
                             document_id=document_id,
                             properties=entity_data.get('properties', {}),
                             aliases=entity_data.get('aliases', []),
@@ -880,15 +947,17 @@ Only respond with valid JSON. Do not include any other text.
                         entities.append(entity)
                         
                         if is_new_type:
-                            logger.info(f"✨ Creating new entity: {entity_name} with new type '{resolved_entity_type}'")
+                            logger.info(f"✨ New entity with new type: '{entity_name}' -> {resolved_entity_type}")
                         else:
-                            logger.info(f"✨ Creating new entity: {entity_name} with existing type '{resolved_entity_type}'")
+                            logger.info(f"✨ New entity with existing type: '{entity_name}' -> {resolved_entity_type}")
+                    else:
+                        logger.info(f"📌 Reused existing entity: '{entity_name}' -> {entity_id}")
                         
                 except Exception as e:
-                    logger.warning(f"Failed to parse entity: {entity_data}, error: {e}")
+                    logger.warning(f"Failed to process entity: {entity_data}, error: {e}")
                     continue
             
-            # Process relationships with type resolution
+            # Process relationships with type resolution and deduplication
             for rel_data in data.get('relationships', []):
                 try:
                     source_name = rel_data['source_entity']
@@ -906,6 +975,23 @@ Only respond with valid JSON. Do not include any other text.
                         logger.warning(f"Missing entity IDs for relationship: {source_name} -> {target_name}")
                         continue
                     
+                    # Check if relationship already exists
+                    existing_relationship = None
+                    if config.enable_relationship_deduplication and self.neo4j_manager:
+                        try:
+                            existing_relationship = await asyncio.wait_for(
+                                self.neo4j_manager.find_existing_relationship(
+                                    source_id, target_id, resolved_rel_type
+                                ),
+                                timeout=5.0
+                            )
+                        except (Exception, asyncio.TimeoutError) as e:
+                            logger.warning(f"⚠️ Error checking for existing relationship: {e}")
+                    
+                    if existing_relationship:
+                        logger.info(f"📌 Relationship already exists: {source_name} -> {target_name} ({resolved_rel_type})")
+                        continue  # Skip creating duplicate relationship
+                    
                     relationship = Relationship(
                         id=str(uuid.uuid4()),
                         source_entity_id=source_id,
@@ -919,13 +1005,18 @@ Only respond with valid JSON. Do not include any other text.
                     relationships.append(relationship)
                     
                     if is_new_type:
-                        logger.info(f"🔗 Creating relationship: {source_name} -> {target_name} with new type '{resolved_rel_type}'")
+                        logger.info(f"🔗 New relationship type: {source_name} -> {target_name} ({resolved_rel_type})")
                     else:
-                        logger.info(f"🔗 Creating relationship: {source_name} -> {target_name} with existing type '{resolved_rel_type}'")
+                        logger.info(f"🔗 Existing relationship type: {source_name} -> {target_name} ({resolved_rel_type})")
                     
                 except Exception as e:
                     logger.warning(f"Failed to parse relationship: {rel_data}, error: {e}")
                     continue
+            
+            logger.info(f"🧩 Extracted {len(entities)} new entities, reused existing entities for deduplication")
+            logger.info(f"🔗 Created {len(relationships)} new relationships")
+            if len(entities) == 0 and len(relationships) == 0:
+                logger.info("📌 All entities and relationships were deduplicated (no new items created)")
             
             return entities, relationships
             
@@ -938,31 +1029,47 @@ Only respond with valid JSON. Do not include any other text.
             return [], []
     
     async def _apply_type_resolution_to_fallback(self, entities: List[Entity], relationships: List[Relationship]) -> Tuple[List[Entity], List[Relationship]]:
-        """Apply type resolution to fallback extraction results."""
+        """Apply type resolution and deduplication to fallback extraction results."""
         resolved_entities = []
         resolved_relationships = []
+        entity_name_to_id = {}
         
-        # Resolve entity types
+        # Process entities with deduplication and type resolution
         for entity in entities:
             resolved_type, is_new_type = await self.type_manager.resolve_entity_type(entity.entity_type)
             
-            # Create new entity with resolved type
-            resolved_entity = Entity(
-                id=entity.id,
-                name=entity.name,
+            # Use enhanced entity deduplication
+            entity_id, is_new_entity = await self._find_or_create_entity(
+                entity_name=entity.name,
                 entity_type=resolved_type,
                 document_id=entity.document_id,
                 properties=entity.properties,
-                aliases=entity.aliases,
-                confidence_score=entity.confidence_score,
-                created_at=entity.created_at
+                confidence=entity.confidence_score
             )
-            resolved_entities.append(resolved_entity)
             
-            if is_new_type:
-                logger.info(f"✨ Fallback entity '{entity.name}' assigned new type '{resolved_type}'")
+            # Store the mapping for relationship processing
+            entity_name_to_id[entity.name] = entity_id
+            
+            # Only create Entity object if it's a new entity
+            if is_new_entity:
+                resolved_entity = Entity(
+                    id=entity_id,
+                    name=entity.name,
+                    entity_type=resolved_type,
+                    document_id=entity.document_id,
+                    properties=entity.properties,
+                    aliases=entity.aliases,
+                    confidence_score=entity.confidence_score,
+                    created_at=entity.created_at
+                )
+                resolved_entities.append(resolved_entity)
+                
+                if is_new_type:
+                    logger.info(f"✨ Fallback entity '{entity.name}' assigned new type '{resolved_type}'")
+                else:
+                    logger.info(f"📌 Fallback entity '{entity.name}' assigned existing type '{resolved_type}'")
             else:
-                logger.info(f"📌 Fallback entity '{entity.name}' assigned existing type '{resolved_type}'")
+                logger.info(f"📌 Fallback entity '{entity.name}' matched existing entity {entity_id}")
         
         # Resolve relationship types
         for relationship in relationships:

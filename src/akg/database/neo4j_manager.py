@@ -253,6 +253,14 @@ class Neo4jManager:
                 # Create relationship with the actual relationship type
                 # Clean the relationship type to be a valid Cypher identifier and convert to ALL CAPS
                 clean_rel_type = relationship_type.replace(" ", "_").replace("-", "_").upper()
+                # Remove any characters that aren't letters, numbers, or underscores
+                clean_rel_type = ''.join(c if c.isalnum() or c == '_' else '_' for c in clean_rel_type)
+                # Ensure it doesn't start with a number
+                if clean_rel_type and clean_rel_type[0].isdigit():
+                    clean_rel_type = f"REL_{clean_rel_type}"
+                # Ensure it's not empty
+                if not clean_rel_type:
+                    clean_rel_type = "UNKNOWN_RELATIONSHIP"
                 
                 query = f"""
                 MATCH (source {{id: $source_entity_id}})
@@ -549,39 +557,181 @@ class Neo4jManager:
             logger.error(f"Error finding entity by name: {e}")
             return None
 
-    async def find_similar_entities(self, name: str, threshold: float = 0.8) -> List[Dict[str, Any]]:
-        """Find entities with similar names using fuzzy matching."""
+    async def find_similar_entities(self, name: str, entity_type: Optional[str] = None, threshold: float = 0.8) -> List[Dict[str, Any]]:
+        """Find entities with similar names using enhanced fuzzy matching."""
         try:
             async with self.driver.session() as session:
-                # Simple approach: find entities that contain the search term or vice versa
-                query = """
+                # Enhanced matching approach with multiple strategies
+                normalized_name = name.lower().strip()
+                
+                # Strategy 1: Exact match (highest priority)
+                exact_match_query = """
                     MATCH (e)
                     WHERE e.id IS NOT NULL AND NOT e:Document 
-                    AND (toLower(e.name) CONTAINS toLower($name)
-                       OR toLower($name) CONTAINS toLower(e.name))
+                    AND toLower(trim(e.name)) = $normalized_name
+                    AND ($entity_type IS NULL OR e.type = $entity_type)
                     RETURN e.id as id, e.name as name, e.type as type,
-                           e.confidence as confidence, e.properties as properties
-                    ORDER BY size(e.name)
+                           e.confidence as confidence, e.properties as properties,
+                           1.0 as similarity_score, 'exact_match' as match_type
+                    LIMIT 5
+                """
+                
+                # Strategy 2: Contains match (medium priority)
+                contains_match_query = """
+                    MATCH (e)
+                    WHERE e.id IS NOT NULL AND NOT e:Document 
+                    AND (toLower(e.name) CONTAINS $normalized_name 
+                         OR $normalized_name CONTAINS toLower(e.name))
+                    AND toLower(trim(e.name)) <> $normalized_name
+                    AND ($entity_type IS NULL OR e.type = $entity_type)
+                    RETURN e.id as id, e.name as name, e.type as type,
+                           e.confidence as confidence, e.properties as properties,
+                           CASE 
+                               WHEN toLower(e.name) CONTAINS $normalized_name THEN 0.9
+                               WHEN $normalized_name CONTAINS toLower(e.name) THEN 0.8
+                               ELSE 0.7
+                           END as similarity_score, 'contains_match' as match_type
+                    ORDER BY similarity_score DESC, size(e.name)
                     LIMIT 10
                 """
                 
-                result = await session.run(query, {"name": name})
-                entities = []
+                # Strategy 3: Similar words/tokens (lower priority)
+                words = normalized_name.split()
+                if len(words) > 1:
+                    word_match_query = """
+                        MATCH (e)
+                        WHERE e.id IS NOT NULL AND NOT e:Document 
+                        AND ($entity_type IS NULL OR e.type = $entity_type)
+                        AND ANY(word IN $words WHERE toLower(e.name) CONTAINS word)
+                        AND NOT (toLower(e.name) CONTAINS $normalized_name 
+                                OR $normalized_name CONTAINS toLower(e.name))
+                        AND toLower(trim(e.name)) <> $normalized_name
+                        RETURN e.id as id, e.name as name, e.type as type,
+                               e.confidence as confidence, e.properties as properties,
+                               0.6 as similarity_score, 'word_match' as match_type
+                        ORDER BY size(e.name)
+                        LIMIT 5
+                    """
+                else:
+                    word_match_query = None
                 
+                all_matches = []
+                
+                # Execute exact match query
+                result = await session.run(exact_match_query, {
+                    "normalized_name": normalized_name,
+                    "entity_type": entity_type
+                })
                 async for record in result:
-                    entities.append({
+                    all_matches.append({
                         "id": record["id"],
                         "name": record["name"],
                         "type": record["type"],
                         "confidence": record["confidence"],
-                        "properties": record["properties"]
+                        "properties": record["properties"],
+                        "similarity_score": record["similarity_score"],
+                        "match_type": record["match_type"]
                     })
                 
-                return entities
+                # If no exact matches and we want broader matching, try contains match
+                if not all_matches:
+                    result = await session.run(contains_match_query, {
+                        "normalized_name": normalized_name,
+                        "entity_type": entity_type
+                    })
+                    async for record in result:
+                        all_matches.append({
+                            "id": record["id"],
+                            "name": record["name"],
+                            "type": record["type"],
+                            "confidence": record["confidence"],
+                            "properties": record["properties"],
+                            "similarity_score": record["similarity_score"],
+                            "match_type": record["match_type"]
+                        })
+                
+                # If still no matches and name has multiple words, try word matching
+                if not all_matches and word_match_query:
+                    result = await session.run(word_match_query, {
+                        "words": words,
+                        "normalized_name": normalized_name,
+                        "entity_type": entity_type
+                    })
+                    async for record in result:
+                        all_matches.append({
+                            "id": record["id"],
+                            "name": record["name"],
+                            "type": record["type"],
+                            "confidence": record["confidence"],
+                            "properties": record["properties"],
+                            "similarity_score": record["similarity_score"],
+                            "match_type": record["match_type"]
+                        })
+                
+                # Sort by similarity score and filter by threshold
+                all_matches.sort(key=lambda x: x["similarity_score"], reverse=True)
+                filtered_matches = [match for match in all_matches if match["similarity_score"] >= threshold]
+                
+                if filtered_matches:
+                    logger.debug(f"Found {len(filtered_matches)} similar entities for '{name}' (type: {entity_type})")
+                    for match in filtered_matches[:3]:  # Log top 3 matches
+                        logger.debug(f"  - '{match['name']}' (type: {match['type']}, score: {match['similarity_score']:.2f}, match: {match['match_type']})")
+                
+                return filtered_matches[:10]  # Return top 10 matches
                 
         except Exception as e:
             logger.error(f"Error finding similar entities: {e}")
             return []
+
+    async def find_existing_relationship(self, source_entity_id: str, target_entity_id: str, 
+                                       relationship_type: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Find existing relationship between two entities."""
+        try:
+            async with self.driver.session() as session:
+                if relationship_type:
+                    # Clean the relationship type to match what we use in creation
+                    clean_rel_type = relationship_type.replace(" ", "_").replace("-", "_").upper()
+                    # Remove any characters that aren't letters, numbers, or underscores
+                    clean_rel_type = ''.join(c if c.isalnum() or c == '_' else '_' for c in clean_rel_type)
+                    # Ensure it doesn't start with a number
+                    if clean_rel_type and clean_rel_type[0].isdigit():
+                        clean_rel_type = f"REL_{clean_rel_type}"
+                    # Ensure it's not empty
+                    if not clean_rel_type:
+                        clean_rel_type = "UNKNOWN_RELATIONSHIP"
+                    
+                    query = f"""
+                        MATCH (source {{id: $source_entity_id}})-[r:{clean_rel_type}]->(target {{id: $target_entity_id}})
+                        RETURN r.confidence as confidence, r.document_id as document_id,
+                               r.created_at as created_at, type(r) as relationship_type
+                        LIMIT 1
+                    """
+                else:
+                    query = """
+                        MATCH (source {id: $source_entity_id})-[r]->(target {id: $target_entity_id})
+                        RETURN r.confidence as confidence, r.document_id as document_id,
+                               r.created_at as created_at, type(r) as relationship_type
+                        LIMIT 1
+                    """
+                
+                result = await session.run(query, {
+                    "source_entity_id": source_entity_id,
+                    "target_entity_id": target_entity_id
+                })
+                
+                async for record in result:
+                    return {
+                        "confidence": record["confidence"],
+                        "document_id": record["document_id"],
+                        "created_at": record["created_at"],
+                        "relationship_type": record["relationship_type"]
+                    }
+                
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error finding existing relationship: {e}")
+            return None
 
     async def clear_all_data(self) -> bool:
         """Clear all data from the Neo4j database."""

@@ -44,6 +44,12 @@ class AKGConfig(BaseSettings):
     similarity_threshold: float = Field(0.8, alias="SIMILARITY_THRESHOLD")
     provenance_enabled: bool = Field(True, alias="PROVENANCE_ENABLED")
     
+    # Entity Deduplication Configuration
+    enable_entity_deduplication: bool = Field(True, alias="ENABLE_ENTITY_DEDUPLICATION")
+    entity_similarity_threshold: float = Field(0.8, alias="ENTITY_SIMILARITY_THRESHOLD")
+    cross_type_similarity_threshold: float = Field(0.95, alias="CROSS_TYPE_SIMILARITY_THRESHOLD")
+    enable_relationship_deduplication: bool = Field(True, alias="ENABLE_RELATIONSHIP_DEDUPLICATION")
+    
     # Local File Ingestion Configuration
     documents_input_dir: str = Field("./documents", alias="DOCUMENTS_INPUT_DIR")
     supported_file_types: str = Field("pdf,docx,txt,md,html,pptx,xlsx", alias="SUPPORTED_FILE_TYPES")
