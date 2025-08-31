@@ -22,6 +22,20 @@ class Neo4jManager:
         self.password = password
         self.driver: Optional[AsyncDriver] = None
         
+    def _sanitize_label(self, label: str) -> str:
+        """Sanitize entity type for use as Neo4j label."""
+        # Convert to uppercase and replace invalid characters with underscore
+        sanitized = label.upper().replace(" ", "_").replace("-", "_")
+        # Remove special characters that aren't allowed in Neo4j labels
+        sanitized = ''.join(c if c.isalnum() or c == '_' else '_' for c in sanitized)
+        # Ensure label starts with letter or underscore
+        if sanitized and not (sanitized[0].isalpha() or sanitized[0] == '_'):
+            sanitized = f"TYPE_{sanitized}"
+        # Ensure label is not empty
+        if not sanitized:
+            sanitized = "UNKNOWN"
+        return sanitized
+        
     async def initialize(self):
         """Initialize Neo4j connection."""
         try:
@@ -55,9 +69,8 @@ class Neo4jManager:
     async def _create_constraints_and_indexes(self):
         """Create necessary constraints and indexes."""
         async with self.driver.session() as session:
-            # Create unique constraints
+            # Create unique constraints (only for Document since entities have specific labels now)
             constraints = [
-                "CREATE CONSTRAINT entity_id_unique IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE",
                 "CREATE CONSTRAINT document_id_unique IF NOT EXISTS FOR (d:Document) REQUIRE d.id IS UNIQUE",
             ]
             
@@ -68,10 +81,8 @@ class Neo4jManager:
                     # Constraint might already exist
                     logger.debug(f"Constraint creation result: {e}")
             
-            # Create indexes for better performance
+            # Create indexes for better performance (only for Document)
             indexes = [
-                "CREATE INDEX entity_name_index IF NOT EXISTS FOR (e:Entity) ON (e.name)",
-                "CREATE INDEX entity_type_index IF NOT EXISTS FOR (e:Entity) ON (e.type)",
                 "CREATE INDEX document_source_index IF NOT EXISTS FOR (d:Document) ON (d.source_path)",
             ]
             
@@ -142,7 +153,7 @@ class Neo4jManager:
     async def create_entity(self, entity_id: str, name: str, entity_type: str,
                           document_id: str, properties: Optional[Dict[str, Any]] = None,
                           confidence: float = 0.0) -> bool:
-        """Create an entity node and optionally link it to a document."""
+        """Create an entity node with dynamic label based on entity type."""
         try:
             async with self.driver.session() as session:
                 # Handle properties properly - set each property individually
@@ -161,9 +172,12 @@ class Neo4jManager:
                     if prop_setters:
                         properties_str = ", " + ", ".join(prop_setters)
                 
-                # Create entity first, then optionally link to document
+                # Sanitize entity_type for use as Neo4j label
+                safe_entity_type = self._sanitize_label(entity_type)
+                
+                # Create entity with only the specific type label (no generic :Entity)
                 query = f"""
-                MERGE (e:Entity {{id: $entity_id}})
+                MERGE (e:{safe_entity_type} {{id: $entity_id}})
                 SET e.name = $name,
                     e.type = $entity_type,
                     e.confidence = $confidence,
@@ -191,7 +205,7 @@ class Neo4jManager:
                     
                     # Now try to link to document if it exists
                     link_query = """
-                    MATCH (e:Entity {id: $entity_id})
+                    MATCH (e {id: $entity_id})
                     MATCH (d:Document {id: $document_id})
                     MERGE (e)-[:MENTIONED_IN]->(d)
                     """
@@ -241,8 +255,8 @@ class Neo4jManager:
                 clean_rel_type = relationship_type.replace(" ", "_").replace("-", "_").upper()
                 
                 query = f"""
-                MATCH (source:Entity {{id: $source_entity_id}})
-                MATCH (target:Entity {{id: $target_entity_id}})
+                MATCH (source {{id: $source_entity_id}})
+                MATCH (target {{id: $target_entity_id}})
                 MERGE (source)-[r:{clean_rel_type}]->(target)
                 SET r.confidence = $confidence,
                     r.document_id = $document_id,
@@ -274,7 +288,7 @@ class Neo4jManager:
         try:
             async with self.driver.session() as session:
                 query = """
-                MATCH (d:Document {id: $document_id})<-[:MENTIONED_IN]-(e:Entity)
+                MATCH (d:Document {id: $document_id})<-[:MENTIONED_IN]-(e)
                 RETURN e.id as id, e.name as name, e.type as type, 
                        e.confidence as confidence, e.properties as properties
                 """
@@ -302,11 +316,11 @@ class Neo4jManager:
         try:
             async with self.driver.session() as session:
                 query = """
-                MATCH (source:Entity)-[r:RELATES_TO]->(target:Entity)
-                WHERE r.document_id = $document_id
+                MATCH (source)-[r]->(target)
+                WHERE r.document_id = $document_id AND source.id IS NOT NULL AND target.id IS NOT NULL
                 RETURN source.id as source_id, source.name as source_name,
                        target.id as target_id, target.name as target_name,
-                       r.type as relationship_type, r.confidence as confidence,
+                       type(r) as relationship_type, r.confidence as confidence,
                        r.properties as properties
                 """
                 
@@ -334,8 +348,8 @@ class Neo4jManager:
         """Get statistics about the knowledge graph."""
         try:
             async with self.driver.session() as session:
-                # Count entities
-                entity_result = await session.run("MATCH (e:Entity) RETURN count(e) as count")
+                # Count entities (all nodes that have an id property and are not Documents)
+                entity_result = await session.run("MATCH (e) WHERE e.id IS NOT NULL AND NOT e:Document RETURN count(e) as count")
                 entity_count = 0
                 async for record in entity_result:
                     entity_count = record["count"]
@@ -367,20 +381,31 @@ class Neo4jManager:
         try:
             async with self.driver.session() as session:
                 if entity_type:
-                    query = """
-                    MATCH (e:Entity)
-                    WHERE e.name CONTAINS $search_term AND e.type = $entity_type
+                    # Try to search by specific label first, then by type property
+                    sanitized_type = self._sanitize_label(entity_type)
+                    query = f"""
+                    MATCH (e:{sanitized_type})
+                    WHERE e.name CONTAINS $search_term
                     RETURN e.id as id, e.name as name, e.type as type, 
-                           e.confidence as confidence, e.properties as properties
+                           e.confidence as confidence, e.properties as properties,
+                           labels(e) as node_labels
+                    UNION
+                    MATCH (e)
+                    WHERE e.name CONTAINS $search_term AND e.type = $entity_type 
+                    AND e.id IS NOT NULL AND NOT e:Document AND NOT e:{sanitized_type}
+                    RETURN e.id as id, e.name as name, e.type as type, 
+                           e.confidence as confidence, e.properties as properties,
+                           labels(e) as node_labels
                     LIMIT 50
                     """
                     params = {"search_term": search_term, "entity_type": entity_type}
                 else:
                     query = """
-                    MATCH (e:Entity)
-                    WHERE e.name CONTAINS $search_term
+                    MATCH (e)
+                    WHERE e.name CONTAINS $search_term AND e.id IS NOT NULL AND NOT e:Document
                     RETURN e.id as id, e.name as name, e.type as type, 
-                           e.confidence as confidence, e.properties as properties
+                           e.confidence as confidence, e.properties as properties,
+                           labels(e) as node_labels
                     LIMIT 50
                     """
                     params = {"search_term": search_term}
@@ -394,7 +419,8 @@ class Neo4jManager:
                         "name": record["name"],
                         "type": record["type"],
                         "confidence": record["confidence"],
-                        "properties": record["properties"]
+                        "properties": record["properties"],
+                        "node_labels": record["node_labels"]
                     })
                     
                 return entities
@@ -409,14 +435,14 @@ class Neo4jManager:
             async with self.driver.session() as session:
                 # Delete relationships first
                 await session.run("""
-                    MATCH ()-[r:RELATES_TO]->()
+                    MATCH ()-[r]->()
                     WHERE r.document_id = $document_id
                     DELETE r
                 """, {"document_id": document_id})
                 
                 # Delete entities that are only connected to this document
                 await session.run("""
-                    MATCH (d:Document {id: $document_id})<-[:MENTIONED_IN]-(e:Entity)
+                    MATCH (d:Document {id: $document_id})<-[:MENTIONED_IN]-(e)
                     WHERE NOT EXISTS {
                         MATCH (e)-[:MENTIONED_IN]->(other:Document)
                         WHERE other.id <> $document_id
@@ -441,7 +467,8 @@ class Neo4jManager:
         try:
             async with self.driver.session() as session:
                 result = await session.run("""
-                    MATCH (e:Entity)
+                    MATCH (e)
+                    WHERE e.type IS NOT NULL AND e.id IS NOT NULL AND NOT e:Document
                     RETURN DISTINCT e.type as type
                     ORDER BY type
                 """)
@@ -483,8 +510,15 @@ class Neo4jManager:
         try:
             async with self.driver.session() as session:
                 if entity_type:
-                    query = """
-                        MATCH (e:Entity {name: $name, type: $entity_type})
+                    sanitized_type = self._sanitize_label(entity_type)
+                    query = f"""
+                        MATCH (e:{sanitized_type} {{name: $name, type: $entity_type}})
+                        RETURN e.id as id, e.name as name, e.type as type,
+                               e.confidence as confidence, e.properties as properties
+                        LIMIT 1
+                        UNION
+                        MATCH (e {{name: $name, type: $entity_type}})
+                        WHERE e.id IS NOT NULL AND NOT e:Document AND NOT e:{sanitized_type}
                         RETURN e.id as id, e.name as name, e.type as type,
                                e.confidence as confidence, e.properties as properties
                         LIMIT 1
@@ -492,7 +526,8 @@ class Neo4jManager:
                     result = await session.run(query, {"name": name, "entity_type": entity_type})
                 else:
                     query = """
-                        MATCH (e:Entity {name: $name})
+                        MATCH (e {name: $name})
+                        WHERE e.id IS NOT NULL AND NOT e:Document
                         RETURN e.id as id, e.name as name, e.type as type,
                                e.confidence as confidence, e.properties as properties
                         LIMIT 1
@@ -520,9 +555,10 @@ class Neo4jManager:
             async with self.driver.session() as session:
                 # Simple approach: find entities that contain the search term or vice versa
                 query = """
-                    MATCH (e:Entity)
-                    WHERE toLower(e.name) CONTAINS toLower($name)
-                       OR toLower($name) CONTAINS toLower(e.name)
+                    MATCH (e)
+                    WHERE e.id IS NOT NULL AND NOT e:Document 
+                    AND (toLower(e.name) CONTAINS toLower($name)
+                       OR toLower($name) CONTAINS toLower(e.name))
                     RETURN e.id as id, e.name as name, e.type as type,
                            e.confidence as confidence, e.properties as properties
                     ORDER BY size(e.name)
@@ -563,3 +599,42 @@ class Neo4jManager:
         except Exception as e:
             logger.error(f"Error clearing database: {e}")
             return False
+            
+    async def get_nodes_with_labels(self, name_filter: str = None) -> List[Dict[str, Any]]:
+        """Get nodes with their labels for testing/debugging."""
+        try:
+            async with self.driver.session() as session:
+                if name_filter:
+                    query = """
+                    MATCH (n)
+                    WHERE n.name CONTAINS $filter OR n.id CONTAINS $filter
+                    RETURN labels(n) as node_labels, n.name as name, n.type as entity_type, 
+                           n.id as id, n.confidence as confidence
+                    ORDER BY n.name
+                    """
+                    result = await session.run(query, {"filter": name_filter})
+                else:
+                    query = """
+                    MATCH (n)
+                    RETURN labels(n) as node_labels, n.name as name, n.type as entity_type, 
+                           n.id as id, n.confidence as confidence
+                    ORDER BY n.name
+                    LIMIT 20
+                    """
+                    result = await session.run(query)
+                
+                nodes = []
+                async for record in result:
+                    nodes.append({
+                        "id": record["id"],
+                        "name": record["name"],
+                        "entity_type": record["entity_type"],
+                        "node_labels": record["node_labels"],
+                        "confidence": record["confidence"]
+                    })
+                    
+                return nodes
+                
+        except Exception as e:
+            logger.error(f"Error getting nodes with labels: {e}")
+            return []

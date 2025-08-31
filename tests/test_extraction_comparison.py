@@ -3,7 +3,12 @@ Test script to compare relationship extraction before and after improvements.
 """
 
 import asyncio
+import os
+import sys
 from datetime import datetime
+
+# Add the parent directory to the path to access src
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 from src.akg.agents.extraction import EntityExtractionAgent
 from src.akg.models import Document

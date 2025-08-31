@@ -353,7 +353,7 @@ class TestNeo4jManager:
         
         # Set up session.run to return the appropriate result based on the query
         def run_side_effect(query, *args, **kwargs):
-            if "MATCH (e:Entity)" in query:
+            if "WHERE e.id IS NOT NULL AND NOT e:Document" in query:
                 return mock_entity_result
             elif "MATCH ()-[r]->()" in query:
                 return mock_rel_result
