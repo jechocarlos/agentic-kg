@@ -343,15 +343,6 @@ The system creates specific, meaningful relationships:
 - ✅ Database management utilities
 - ✅ Error handling and fallback mechanisms
 
-🚧 **Future Enhancements:**
-- [ ] Web interface for graph visualization
-- [ ] Advanced querying capabilities with natural language
-- [ ] Multi-source document ingestion (SharePoint, Confluence)
-- [ ] Real-time collaboration features
-- [ ] Advanced conflict resolution workflows
-- [ ] Cross-domain type correlation analysis
-- [ ] Manual domain type curation interface
-
 ## 🛠️ Utility Commands
 
 ```bash
@@ -391,7 +382,6 @@ python tests/check_caps.py
 
 ### Database Design
 - **Neo4j**: Stores entities and relationships with full property sets
-- **Dynamic Labels**: Entities have both `:Entity` base label and specific type labels (`:Entity:PERSON`)
 - **Supabase**: Document storage with metadata, processing status, and domain type caching
 - **Domain Intelligence**: Automatic domain classification with type learning by domain
 - **Type Management**: Dynamic schema evolution based on document content
