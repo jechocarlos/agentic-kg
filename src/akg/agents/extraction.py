@@ -56,6 +56,10 @@ class EntityExtractionAgent:
         document_analysis = await self._analyze_document_nature(document)
         logger.info(f"📋 Document analysis: {document_analysis['domain']} - {document_analysis['description']}")
         
+        # Step 2: Extract document-level context with key entities and relationships
+        document_context = await self._extract_document_context(document, document_analysis)
+        logger.info(f"🌍 Document context extracted: {len(document_context.get('key_entities', []))} key entities, {len(document_context.get('main_themes', []))} themes")
+        
         # Refresh type cache to get latest types from Neo4j
         await self.type_manager.refresh_type_cache()
         
@@ -77,12 +81,12 @@ class EntityExtractionAgent:
             # Try Gemini first with adaptive prompting
             if self.model:
                 try:
-                    # Create adaptive extraction prompt based on document analysis
+                    # Create adaptive extraction prompt based on document analysis and context
                     existing_entity_types = list(self.type_manager._entity_types_cache)
                     existing_relationship_types = list(self.type_manager._relationship_types_cache)
                     
-                    prompt = self._create_adaptive_extraction_prompt(
-                        chunk, document_analysis, existing_entity_types, existing_relationship_types, document.title
+                    prompt = self._create_context_aware_extraction_prompt(
+                        chunk, document_analysis, document_context, existing_entity_types, existing_relationship_types, document.title
                     )
                     
                     # Get response from Gemini
@@ -93,9 +97,9 @@ class EntityExtractionAgent:
                     
                     # Apply coreference resolution to resolve pronouns and generic references
                     if entities and config.enable_coreference_resolution:
-                        document_context = self._determine_document_context(document.title, document.document_type)
-                        logger.info(f"🔗 Applying coreference resolution for chunk {i+1} (context: {document_context})")
-                        entities = await self.coreference_resolver.resolve_coreferences_in_entities(entities, document_context)
+                        context_type = self._determine_document_context(document.title, document.document_type)
+                        logger.info(f"🔗 Applying coreference resolution for chunk {i+1} (context: {context_type})")
+                        entities = await self.coreference_resolver.resolve_coreferences_in_entities(entities, context_type)
                     
                     # Save entities and relationships immediately after each chunk
                     if entities or relationships:
@@ -134,9 +138,9 @@ class EntityExtractionAgent:
                     
                     # Apply coreference resolution to fallback results
                     if entities and config.enable_coreference_resolution:
-                        document_context = self._determine_document_context(document.title, document.document_type)
-                        logger.info(f"🔗 Applying coreference resolution for fallback chunk {i+1} (context: {document_context})")
-                        entities = await self.coreference_resolver.resolve_coreferences_in_entities(entities, document_context)
+                        context_type = self._determine_document_context(document.title, document.document_type)
+                        logger.info(f"🔗 Applying coreference resolution for fallback chunk {i+1} (context: {context_type})")
+                        entities = await self.coreference_resolver.resolve_coreferences_in_entities(entities, context_type)
                     
                     # Save fallback results immediately to Neo4j
                     if entities or relationships:
@@ -373,11 +377,148 @@ Respond with valid JSON only:
             'analysis_method': 'keyword_based'
         }
 
-    def _create_adaptive_extraction_prompt(self, chunk: str, document_analysis: Dict[str, Any], 
-                                         existing_entity_types: Optional[List[str]] = None,
-                                         existing_relationship_types: Optional[List[str]] = None, 
-                                         document_title: str = "") -> str:
-        """Create an adaptive extraction prompt based on document analysis."""
+    async def _extract_document_context(self, document: Document, document_analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract document-level context including key entities, themes, and patterns to guide chunk-level extraction."""
+        logger.info(f"🌍 Extracting document-level context for: {document.title}")
+        
+        if not self.model:
+            # Fallback context extraction
+            return self._fallback_document_context(document, document_analysis)
+        
+        # Use a longer content sample for context analysis (first 3000 chars)
+        content_sample = document.content[:3000]
+        
+        context_prompt = f"""
+Analyze this document to extract key entities, themes, and patterns that will guide detailed extraction.
+
+DOCUMENT: {document.title}
+DOMAIN: {document_analysis.get('domain', 'general')}
+CONTENT SAMPLE (first 3000 chars):
+{content_sample}
+
+Extract document-level context to guide chunk processing. Focus on:
+
+1. KEY ENTITIES: Main people, organizations, concepts, objects mentioned throughout
+2. MAIN THEMES: Core topics and subjects the document covers
+3. ENTITY PATTERNS: Common entity types and naming patterns (e.g., "we/our" refers to what organization?)
+4. PRONOUN REFERENCES: What do pronouns like "we", "our", "the company", "they" refer to?
+5. RELATIONSHIP PATTERNS: Common action verbs and relationship types used
+
+CRITICAL: Identify pronoun mappings to prevent pronoun extraction as entities:
+- "we/our/us" → [actual organization name]
+- "they/them" → [actual group/organization name] 
+- "the company" → [actual company name]
+- "the team" → [actual team name]
+- "the system" → [actual system name]
+
+Respond with JSON:
+{{
+  "key_entities": [
+    {{
+      "name": "Entity Name",
+      "type": "ENTITY_TYPE", 
+      "aliases": ["alias1", "alias2"],
+      "context": "where/how it appears in document"
+    }}
+  ],
+  "main_themes": ["theme1", "theme2", "theme3"],
+  "pronoun_mappings": {{
+    "we": "Actual Organization Name",
+    "our": "Actual Organization Name", 
+    "they": "Actual Group Name",
+    "the company": "Actual Company Name",
+    "the team": "Actual Team Name"
+  }},
+  "common_verbs": ["verb1", "verb2", "verb3"],
+  "relationship_patterns": [
+    {{
+      "pattern": "X manages Y",
+      "relationship_type": "MANAGES"
+    }}
+  ],
+  "entity_naming_patterns": {{
+    "pattern_description": "how entities are typically named",
+    "examples": ["example1", "example2"]
+  }}
+}}
+"""
+        
+        try:
+            response = self.model.generate_content(context_prompt)
+            context_data = json.loads(response.text.strip())
+            
+            # Validate and enhance the context
+            context_data['extraction_method'] = 'ai_generated'
+            context_data['document_id'] = document.id
+            
+            logger.info(f"✅ Extracted document context: {len(context_data.get('key_entities', []))} key entities, {len(context_data.get('pronoun_mappings', {}))} pronoun mappings")
+            return context_data
+            
+        except Exception as e:
+            logger.warning(f"AI context extraction failed: {e}, using fallback")
+            return self._fallback_document_context(document, document_analysis)
+
+    def _fallback_document_context(self, document: Document, document_analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Fallback method for extracting document context using simple heuristics."""
+        
+        # Extract potential key entities using simple patterns
+        content = document.content
+        title_words = document.title.split()
+        
+        # Look for capitalized words that might be entities
+        import re
+        capitalized_words = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', content)
+        
+        # Common pronoun mappings based on title and capitalized words
+        potential_org = None
+        for word in capitalized_words:
+            if any(org_word in word.lower() for org_word in ['corp', 'inc', 'company', 'ltd', 'organization']):
+                potential_org = word
+                break
+        
+        if not potential_org and title_words:
+            potential_org = title_words[0]  # Use first word of title as fallback
+        
+        pronoun_mappings = {}
+        if potential_org:
+            pronoun_mappings.update({
+                "we": potential_org,
+                "our": potential_org,
+                "us": potential_org,
+                "the company": potential_org,
+                "the organization": potential_org
+            })
+        
+        return {
+            'key_entities': [
+                {
+                    'name': potential_org or 'Unknown Organization',
+                    'type': 'ORGANIZATION',
+                    'aliases': ['we', 'our', 'us', 'the company'],
+                    'context': 'inferred from document structure'
+                }
+            ],
+            'main_themes': [document_analysis.get('content_focus', 'general content')],
+            'pronoun_mappings': pronoun_mappings,
+            'common_verbs': ['is', 'has', 'manages', 'creates', 'uses'],
+            'relationship_patterns': [
+                {'pattern': 'X manages Y', 'relationship_type': 'MANAGES'},
+                {'pattern': 'X uses Y', 'relationship_type': 'USES'}
+            ],
+            'entity_naming_patterns': {
+                'pattern_description': 'Capitalized words and phrases',
+                'examples': capitalized_words[:5]
+            },
+            'extraction_method': 'heuristic_based',
+            'document_id': document.id
+        }
+
+    def _create_context_aware_extraction_prompt(self, chunk: str, document_analysis: Dict[str, Any], 
+                                               document_context: Dict[str, Any],
+                                               existing_entity_types: Optional[List[str]] = None,
+                                               existing_relationship_types: Optional[List[str]] = None, 
+                                               document_title: str = "") -> str:
+        """Create a context-aware extraction prompt that prevents pronoun extraction and promotes atomic relationships."""
         
         domain = document_analysis.get('domain', 'general')
         subdomain = document_analysis.get('subdomain', '')
@@ -385,81 +526,104 @@ Respond with valid JSON only:
         key_relationship_types = document_analysis.get('key_relationship_types', [])
         content_focus = document_analysis.get('content_focus', 'general content')
         
-        # Build context-aware type guidance
-        entity_type_guidance = f"\nFor this {domain} document focusing on {content_focus}:"
-        entity_type_guidance += f"\nPriority entity types: {', '.join(key_entity_types)}"
-        if existing_entity_types:
-            entity_type_guidance += f"\nExisting types in knowledge base: {', '.join(existing_entity_types[:10])}..."
-        entity_type_guidance += f"\nCreate new types as needed that fit the {domain} domain."
+        # Extract document context
+        key_entities = document_context.get('key_entities', [])
+        pronoun_mappings = document_context.get('pronoun_mappings', {})
+        common_verbs = document_context.get('common_verbs', [])
+        relationship_patterns = document_context.get('relationship_patterns', [])
         
-        relationship_type_guidance = f"\nFor this {domain} document:"
-        relationship_type_guidance += f"\nPriority relationship types: {', '.join(key_relationship_types)}"
-        if existing_relationship_types:
-            relationship_type_guidance += f"\nExisting types in knowledge base: {', '.join(existing_relationship_types[:10])}..."
-        relationship_type_guidance += f"\nCreate new relationships that capture {domain}-specific connections."
+        # Build pronoun replacement instructions
+        pronoun_instructions = "\nPRONOUN REPLACEMENT RULES (CRITICAL):\n"
+        if pronoun_mappings:
+            for pronoun, entity in pronoun_mappings.items():
+                pronoun_instructions += f"- Replace '{pronoun}' with '{entity}'\n"
+        pronoun_instructions += "- NEVER extract pronouns (we, our, they, it, this, that) as entities\n"
+        pronoun_instructions += "- ALWAYS replace with the actual entity they refer to\n"
         
-        # Create domain-specific instructions
-        domain_instructions = self._get_domain_specific_instructions(domain, subdomain)
+        # Build context-aware entity guidance
+        context_entities = "\nKEY ENTITIES FROM DOCUMENT CONTEXT:\n"
+        for entity in key_entities:
+            context_entities += f"- {entity['name']} ({entity['type']}): {entity.get('context', '')}\n"
+            if entity.get('aliases'):
+                context_entities += f"  Aliases: {', '.join(entity['aliases'])}\n"
+        
+        # Build relationship pattern guidance
+        relationship_guidance = "\nRELATIONSHIP PATTERNS FROM DOCUMENT:\n"
+        for pattern in relationship_patterns:
+            relationship_guidance += f"- {pattern['pattern']} → {pattern['relationship_type']}\n"
+        
+        if common_verbs:
+            relationship_guidance += f"\nCommon verbs to use: {', '.join(common_verbs)}\n"
+        
+        # Build atomic relationship instructions
+        atomic_instructions = """
+ATOMIC RELATIONSHIP RULES (CRITICAL):
+1. Use SINGLE ACTION VERBS only: MANAGES, CREATES, USES, OWNS, REPORTS_TO
+2. NEVER combine multiple concepts: NOT "DETERMINE_LOCATION_FOR_PURPOSE" 
+3. Break complex relationships into multiple atomic ones:
+   - "determine location for purpose" becomes:
+     * Subject --[DETERMINES]--> Location
+     * Location --[FOR_PURPOSE_OF]--> Purpose
+4. Extract EVERY verb as a separate relationship
+5. Use verbs directly from the text: "schedules" → "SCHEDULES", "manages" → "MANAGES"
+6. Maximum 2-3 words per relationship type
+"""
         
         prompt = f"""
 You are an expert knowledge graph builder specializing in {domain} domain extraction.
-Extract comprehensive SUBJECT-PREDICATE-OBJECT triples from this {domain} document chunk.
+Extract ATOMIC SUBJECT-PREDICATE-OBJECT triples from this document chunk.
 
 DOCUMENT: {document_title} (Domain: {domain})
 CONTENT CHUNK:
 {chunk}
 
-DOMAIN ANALYSIS:
-{entity_type_guidance}
-{relationship_type_guidance}
+{pronoun_instructions}
+{context_entities}
+{relationship_guidance}
+{atomic_instructions}
 
-DOMAIN-SPECIFIC INSTRUCTIONS:
-{domain_instructions}
+EXTRACTION PRINCIPLES:
+1. Use ATOMIC, single-action relationships only
+2. Replace ALL pronouns using the pronoun mapping rules
+3. Extract EVERY verb in the text as a relationship
+4. Focus on {content_focus} and {domain} domain
+5. Use actual words from the text for relationship types
+6. Break complex actions into multiple simple relationships
+7. Extract 5-10+ relationships per entity - be comprehensive!
 
-UNIVERSAL EXTRACTION PRINCIPLES:
-1. Extract ALL entities relevant to the {domain} domain
-2. For EVERY ACTION WORD/VERB in the text, create a relationship using that verb
-3. Use ACTUAL VERBS from the document: "assigns" → "ASSIGNS", "schedules" → "SCHEDULES", "creates" → "CREATES"
-4. Look for Subject-VERB-Object patterns in every sentence
-5. Focus on {content_focus}
-6. Use domain-appropriate terminology and concepts
-7. Create granular, specific relationship types from the actual text
-8. Include confidence scores (0.0-1.0) based on certainty
-9. Add properties for domain-specific context
-10. Extract 5-10+ relationships per entity minimum - be aggressive!
+EXAMPLES OF ATOMIC RELATIONSHIP EXTRACTION:
+❌ BAD: "Company --[DETERMINE_LOCATION_FOR_PURPOSE]--> Meeting"
+✅ GOOD: "Company --[DETERMINES]--> Location", "Location --[FOR_PURPOSE_OF]--> Meeting"
 
-VERB-TO-RELATIONSHIP CONVERSION EXAMPLES:
-- "Sarah manages the project" → Sarah --[MANAGES]--> Project
-- "Mike will create requirements" → Mike --[WILL_CREATE]--> Requirements  
-- "Team uses React" → Team --[USES]--> React
-- "Budget is allocated to development" → Budget --[ALLOCATED_TO]--> Development
-- "Meeting scheduled for Monday" → Meeting --[SCHEDULED_FOR]--> Monday
-- "Document describes the process" → Document --[DESCRIBES]--> Process
-- "System integrates with database" → System --[INTEGRATES_WITH]--> Database
+❌ BAD: "We --[MANAGES]--> Project" (pronoun as entity)
+✅ GOOD: "{pronoun_mappings.get('we', 'Organization')} --[MANAGES]--> Project"
+
+❌ BAD: "System --[INTEGRATES_WITH_DATABASE_FOR_STORAGE]--> Data"
+✅ GOOD: "System --[INTEGRATES_WITH]--> Database", "Database --[STORES]--> Data"
 
 RESPONSE FORMAT (JSON only):
 {{
   "entities": [
     {{
-      "name": "Entity Name",
+      "name": "Actual Entity Name (NOT pronouns)",
       "type": "DOMAIN_APPROPRIATE_TYPE",
       "aliases": ["alias1", "alias2"],
-      "properties": {{"domain_specific_property": "value", "context": "additional context"}},
+      "properties": {{"context": "specific context", "domain": "{domain}"}},
       "confidence": 0.9
     }}
   ],
   "relationships": [
     {{
-      "source_entity": "Subject Entity",
-      "target_entity": "Object Entity", 
-      "type": "DOMAIN_SPECIFIC_RELATIONSHIP",
-      "properties": {{"context": "domain context", "specifics": "domain-specific details"}},
+      "source_entity": "Actual Entity Name",
+      "target_entity": "Actual Entity Name", 
+      "type": "SINGLE_ATOMIC_VERB",
+      "properties": {{"context": "specific context", "text_source": "exact text from chunk"}},
       "confidence": 0.8
     }}
   ]
 }}
 
-Only respond with valid JSON. Focus on {domain}-specific, comprehensive extraction.
+Focus on {domain}-specific, atomic extraction with pronoun replacement.
 """
         return prompt
 
