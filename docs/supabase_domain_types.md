@@ -1,15 +1,17 @@
 # Domain-Specific Fallback Types with Supabase
 
-This document explains the new Supabase integration for storing and managing domain-specific entity and relationship types as fallback patterns.
+This document explains the Supabase integration for storing and managing domain-specific entity and relationship types as intelligent fallback patterns.
 
 ## Overview
 
-The system now uses Supabase to:
-1. **Cache document analysis results** to avoid re-analyzing similar documents
+The AKG system now uses Supabase to create a robust, learning-based knowledge extraction pipeline:
+
+1. **Cache document analysis results** to avoid re-analyzing similar documents  
 2. **Store domain-specific entity types** learned from document analysis
 3. **Store domain-specific relationship types** extracted from verbs in documents
 4. **Track verb extractions** for improving relationship detection
-5. **Provide fallback types** when AI services are unavailable
+5. **Provide intelligent fallback types** when AI services are unavailable
+6. **Enable cross-document learning** for improved domain adaptation
 
 ## Database Schema
 
@@ -139,15 +141,20 @@ technical_relationships = await supabase_manager.get_domain_relationship_types(
 ### Setup Supabase
 
 1. **Run the schema migration**:
-   ```sql
-   -- In your Supabase SQL editor
-   \i database/domain_types_schema.sql
+   ```bash
+   # Apply the migration in your Supabase SQL editor
+   # Copy content from: supabase/migrations/20250830_create_domain_types_schema.sql
    ```
 
 2. **Set environment variables**:
    ```bash
-   export SUPABASE_URL="your-supabase-url"
+   export SUPABASE_URL="https://your-project-ref.supabase.co"
    export SUPABASE_ANON_KEY="your-anon-key"
+   ```
+
+3. **Test the integration**:
+   ```bash
+   python tests/demo_supabase_mcp_workflow.py
    ```
 
 ### Initialize with Supabase Support
@@ -218,24 +225,31 @@ tech_relationships = await supabase_manager.get_domain_relationship_types("techn
 
 ## Testing
 
-Run the test script to verify Supabase integration:
+Run the comprehensive test script to verify Supabase integration:
 
 ```bash
 # Set environment variables first
 export SUPABASE_URL="your-url"
 export SUPABASE_ANON_KEY="your-key"
 
-# Run the test
-python test_supabase_domain_types.py
+# Run the demonstration workflow
+python tests/demo_supabase_mcp_workflow.py
+
+# Test domain type functionality
+python tests/test_supabase_domain_types.py
+
+# Test MCP integration
+python tests/test_supabase_mcp_domain_types.py
 ```
 
-The test will:
-- Initialize Supabase connection
-- Process a test document with domain-specific content
+The tests will:
+- Initialize Supabase connection and verify schema
+- Process test documents with domain-specific content
 - Store entity types, relationship types, and verb extractions
-- Retrieve and display stored domain types
-- Show domain statistics
+- Retrieve and display stored domain types with statistics
+- Show domain analytics and usage patterns
 - Test fallback behavior without Supabase
+- Demonstrate dynamic node labeling integration
 
 ## Migration from Previous Version
 
@@ -252,7 +266,10 @@ To enable Supabase features:
 ## Future Enhancements
 
 1. **Cross-document Type Correlation**: Analyze how types relate across different documents
-2. **Domain Confidence Scoring**: Improve confidence calculations based on usage patterns
+2. **Domain Confidence Scoring**: Improve confidence calculations based on usage patterns  
 3. **Type Recommendation**: Suggest entity/relationship types for new domains
 4. **Manual Type Curation**: Interface for reviewing and approving discovered types
 5. **Export/Import**: Backup and restore domain type collections
+6. **Dynamic Node Label Integration**: Enhanced Neo4j labeling based on domain types
+7. **Verb Pattern Analytics**: Advanced analysis of verb-to-relationship mappings
+8. **Real-time Domain Detection**: Live classification of documents as they're processed

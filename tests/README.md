@@ -20,9 +20,11 @@ This directory contains all test files for the Agentic Knowledge Graph (AKG) sys
 - **`test_extraction_comparison.py`** - Compare extraction approaches
 
 ### Utility Files
+- **`demo_supabase_mcp_workflow.py`** - Comprehensive Supabase MCP workflow demonstration
 - **`test_runner.py`** - Script to run all tests
 - **`conftest.py`** - Pytest configuration and fixtures
 - **`clear_and_reprocess.py`** - Utility to clear and reprocess data
+- **`check_caps.py`** - Verify ALL CAPS relationship compliance
 
 ## Running Tests
 
@@ -37,6 +39,7 @@ python tests/test_runner.py
 cd /path/to/akg
 python tests/test_dynamic_node_types.py
 python tests/test_supabase_domain_types.py
+python tests/demo_supabase_mcp_workflow.py
 ```
 
 ### Run with Pytest (if applicable)
@@ -64,9 +67,15 @@ Full pipeline testing:
 
 ### 4. Demo/Comparison Tests
 Feature demonstrations:
-- `test_dynamic_node_types.py`
-- `test_adaptive_extraction.py`
-- `test_extraction_comparison.py`
+- `test_dynamic_node_types.py` - Compare static vs dynamic node labeling
+- `test_adaptive_extraction.py` - Adaptive processing demonstrations
+- `test_extraction_comparison.py` - Extraction approach comparisons
+- `demo_supabase_mcp_workflow.py` - Complete Supabase MCP workflow demo
+
+### 5. Utility Scripts
+Database and system utilities:
+- `clear_and_reprocess.py` - Reset and reprocess all data
+- `check_caps.py` - Verify relationship naming compliance
 
 ## Requirements
 
